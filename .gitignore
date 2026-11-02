@@ -1,0 +1,20 @@
+__pycache__/
+.pytest_cache/
+*.egg-info/
+.venv/
+bags/
+artifacts/
+
+# Local deployments, recordings and private environment settings.
+/sites/
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+*.bag
+.recorder_sessions/
+.env
+.env.*
+!.env.example
+*.pem
+*.key

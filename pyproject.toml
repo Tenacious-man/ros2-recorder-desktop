@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ros2-recorder-desktop"
+version = "0.1.0"
+description = "A Chinese desktop recording console for ROS 2"
+requires-python = ">=3.8"
+dependencies = ["PyQt5>=5.14", "PyYAML>=5.3"]
+
+[project.scripts]
+ros2-recorder = "ros2_recorder.app:main"
+
+[tool.setuptools.packages.find]
+include = ["ros2_recorder*"]
+
+[tool.setuptools.package-data]
+ros2_recorder = ["assets/*.svg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: launches a local ROS publisher and rosbag recorder"]
