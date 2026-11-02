@@ -2,10 +2,10 @@
 
 ## 使用 deb 安装包（移植到其他电脑）
 
-把 `ros2-recorder-desktop_0.1.0-1_all.deb` 复制到目标 Ubuntu 电脑，在安装包所在目录运行：
+把 `ros2-recorder-desktop_0.1.1-1_all.deb` 复制到目标 Ubuntu 电脑，在安装包所在目录运行：
 
 ```bash
-sudo apt install ./ros2-recorder-desktop_0.1.0-1_all.deb
+sudo apt install ./ros2-recorder-desktop_0.1.1-1_all.deb
 ```
 
 安装后在应用菜单搜索“ROS 2 录制工作台”，或运行 `ros2-recorder`。使用 `apt install` 会按声明补齐缺少的界面依赖，需要可用的软件源和网络；此 deb 不是包含全部依赖的离线安装包。
@@ -36,7 +36,7 @@ ros2-recorder-setup --install-ros
 python3 make_deb.py
 ```
 
-生成目录为 `artifacts/`，同时生成 SHA-256 校验文件；重新发布修改版时可用 `python3 make_deb.py --version 0.1.0-2` 增加包版本。构建使用 `dpkg-deb`，无需管理员权限，不会在本机安装软件。
+生成目录为 `artifacts/`，同时生成 SHA-256 校验文件；重新发布修改版时可用 `python3 make_deb.py --version 0.1.1-2` 增加包版本。构建使用 `dpkg-deb`，无需管理员权限，不会在本机安装软件。
 
 ## 使用源码压缩包
 

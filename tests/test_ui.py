@@ -101,10 +101,9 @@ def test_detection_startup_ignores_old_profile_but_preserves_session_choice(tmp_
     app.processEvents()
     try:
         assert window.auto_frequency.isChecked(), 'old saved False overrode startup default'
-        assert window._frequency_text('/later') == '等待发现'
-        toggle = window.topic_table.cellWidget(0, 5)
-        assert toggle.text() == '待发现' and not toggle.isEnabled()
-        assert 'Domain' in toggle.toolTip()
+        assert window.topic_table.rowCount() == 0
+        assert window.topic_count.text() == '显示 0/0 · 已勾选 0'
+        assert window.get_config().topics == ['/later']
         window.apply_config(RecordConfig(auto_detect_frequency=False), load_env=False)
         assert window.auto_frequency.isChecked()
         window.auto_frequency.setChecked(False)
@@ -136,6 +135,7 @@ def test_discovery_retries_latest_environment_when_previous_probe_is_busy(tmp_pa
         window._set_environment({'test_environment': 'base'}, '', '', [])
         assert old_started.wait(2)
         window._set_environment({'test_environment': 'overlay'}, '/overlay/setup.bash', '', [])
+        assert window.topic_table.rowCount() == 0
         release_old.set()
         deadline = time.monotonic() + 5
         while window.tasks or window.discovery_busy or '/overlay' not in window.monitors:
@@ -148,4 +148,48 @@ def test_discovery_retries_latest_environment_when_previous_probe_is_busy(tmp_pa
         assert window.topic_table.cellWidget(0, 5).text() == '关闭'
     finally:
         release_old.set()
+        window.close()
+
+
+def test_profiles_only_select_real_topics_without_adding_offline_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path))
+    monkeypatch.setattr(MainWindow, '_initialize_environment', lambda *args: None)
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(auto_discover=False)
+    window.timer.stop()
+    app.processEvents()
+    try:
+        profile = RecordConfig(all_topics=False, topics=['/lidar', '/offline'], cache_mib=256)
+        window.apply_config(profile, load_env=False)
+        assert window.get_config().topics == ['/lidar', '/offline']
+        assert window.cache.value() == 256
+        assert window.display_topics == [] and window.topic_table.rowCount() == 0
+        assert window.topic_count.text() == '显示 0/0 · 已勾选 0'
+        window.topics = [dict(name=name, types=['std_msgs/msg/String'], publishers=1, available=True)
+                         for name in ['/lidar', '/radar']]
+        window._render_topics()
+        assert [t['name'] for t in window.display_topics] == ['/lidar', '/radar']
+        assert window.topic_table.item(0, 0).checkState() == Qt.Checked
+        assert window.topic_table.item(1, 0).checkState() == Qt.Unchecked
+        assert window.topic_count.text() == '显示 2/2 · 已勾选 1'
+        window.apply_config(RecordConfig(all_topics=False, topics=['/radar', '/another_offline']), load_env=False)
+        assert window.topic_table.rowCount() == 2
+        assert window.topic_table.item(0, 0).checkState() == Qt.Unchecked
+        assert window.topic_table.item(1, 0).checkState() == Qt.Checked
+        window.topics = []
+        window._render_topics()
+        assert window.topic_table.rowCount() == 0
+        assert window.topic_count.text() == '显示 0/0 · 已勾选 0'
+        assert window.get_config().topics == ['/another_offline', '/radar']
+        monkeypatch.setattr('ros2_recorder.app.QInputDialog.getText', lambda *args: ('/manual_later', True))
+        window.add_topic()
+        assert window.topic_table.rowCount() == 0
+        assert '/manual_later' in window.get_config().topics
+        assert '发现后会显示并自动勾选' in window.event_log.toPlainText()
+        window.topics = [dict(name='/manual_later', types=['std_msgs/msg/String'], publishers=1, available=True)]
+        window._render_topics()
+        assert window.topic_table.rowCount() == 1
+        assert window.topic_table.item(0, 0).checkState() == Qt.Checked
+        assert window.topic_count.text() == '显示 1/1 · 已勾选 1'
+    finally:
         window.close()

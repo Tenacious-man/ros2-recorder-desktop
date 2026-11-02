@@ -791,6 +791,8 @@ class MainWindow(QMainWindow):
         self.run_task(work, loaded, failed)
 
     def _set_environment(self, env, setup, workspace, packages):
+        if env != self.active_env:
+            self.topics = []
         self.active_env = env
         self.loaded_setup = setup
         self.active_workspace = workspace
@@ -803,6 +805,7 @@ class MainWindow(QMainWindow):
         self.environment_label.setText("消息环境：" + label)
         self.env_status.setText(label)
         self._append(self.environment_log, "已加载：" + label)
+        self._render_topics()
         if self.auto_discover and not self.pending_close:
             self.refresh_topics()
 
@@ -845,9 +848,6 @@ class MainWindow(QMainWindow):
             return
         self.topic_table.blockSignals(True)
         rows = {t['name']: t for t in self.topics}
-        for name in self.selected_topics:
-            rows.setdefault(name, {"name": name, "types": ["等待发现"], "publishers": 0,
-                                   "available": True, "qos": "", "pending": True})
         self.display_topics = [rows[k] for k in sorted(rows)]
         self.topic_table.setRowCount(len(rows))
         for row, topic in enumerate(self.display_topics):
@@ -910,7 +910,8 @@ class MainWindow(QMainWindow):
             visible += show
             hidden_selected += not show and topic['name'] in self.selected_topics
         if hasattr(self, 'topic_count'):
-            message = f'显示 {visible}/{len(self.display_topics)} · 已勾选 {len(self.selected_topics)}'
+            discovered_selected = sum(t['name'] in self.selected_topics for t in self.display_topics)
+            message = f'显示 {visible}/{len(self.display_topics)} · 已勾选 {discovered_selected}'
             if hidden_selected:
                 message += f'（含搜索结果外 {hidden_selected} 个）'
             self.topic_count.setText(message)
@@ -951,6 +952,8 @@ class MainWindow(QMainWindow):
                 return
             self.selected_topics.add(name)
             self._render_topics()
+            if not any(t['name'] == name for t in self.topics):
+                self._append(self.event_log, f"已加入录制选择：{name}；当前未发现该话题，发现后会显示并自动勾选。")
 
     def toggle_frequency(self, name):
         if self.frequency_suspended:

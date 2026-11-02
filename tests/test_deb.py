@@ -10,6 +10,8 @@ import tarfile
 
 import pytest
 
+from ros2_recorder import __version__
+
 
 @pytest.fixture(scope='module')
 def deb_bundle(tmp_path_factory):
@@ -18,7 +20,7 @@ def deb_bundle(tmp_path_factory):
     target = tmp_path_factory.mktemp('deb-package')
     root = Path(__file__).resolve().parents[1]
     subprocess.run([sys.executable, str(root / 'make_deb.py'), '--output-dir', str(target)], check=True, capture_output=True)
-    package = target / 'ros2-recorder-desktop_0.1.0-1_all.deb'
+    package = target / f'ros2-recorder-desktop_{__version__}-1_all.deb'
     extracted = target / 'extracted'
     subprocess.run(['dpkg-deb', '-x', str(package), str(extracted)], check=True)
     return package, extracted
@@ -28,7 +30,7 @@ def test_deb_metadata_payload_permissions_and_checksums(deb_bundle):
     package, extracted = deb_bundle
     field = lambda name: subprocess.check_output(['dpkg-deb', '-f', str(package), name], text=True).strip()
     assert field('Package') == 'ros2-recorder-desktop'
-    assert field('Version') == '0.1.0-1'
+    assert field('Version') == f'{__version__}-1'
     assert field('Architecture') == 'all'
     assert 'python3-pyqt5' in field('Depends') and 'python3-yaml' in field('Depends')
     assert 'humble' not in field('Depends') and 'jazzy' not in field('Depends')
