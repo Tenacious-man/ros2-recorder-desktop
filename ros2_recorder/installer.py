@@ -25,7 +25,7 @@ COMMON_PACKAGES = (
     'fonts-noto-cjk',
 )
 ROS_COMPONENTS = (
-    'ros2bag', 'rosbag2-transport', 'rosbag2-storage-default-plugins',
+    'ros2bag', 'rosbag2-py', 'rosbag2-transport', 'rosbag2-storage-default-plugins',
     'rclpy', 'rosidl-runtime-py', 'rosidl-default-generators',
     'ament-cmake', 'ament-index-python', 'std-msgs', 'sensor-msgs',
 )

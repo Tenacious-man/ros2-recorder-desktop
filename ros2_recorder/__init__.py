@@ -1,2 +1,2 @@
 """ROS 2 Recorder desktop application."""
-__version__ = "0.1.3"
+__version__ = "0.3.2"

@@ -82,7 +82,7 @@ def emit(value):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["topics", "hz", "watch"])
+    parser.add_argument("mode", choices=["topics", "hz", "watch", "stamps"])
     parser.add_argument("--control")
     parser.add_argument("--hidden", action="store_true")
     parser.add_argument("--topic", default="")
@@ -99,6 +99,12 @@ def main():
     try:
         if args.mode == 'watch':
             return watch_topics(node, executor, context, Path(args.control))
+        if args.mode == 'stamps':
+            if __package__:
+                from .stamp_probe import watch_stamps
+            else:
+                from stamp_probe import watch_stamps
+            return watch_stamps(node, executor, context, Path(args.control), emit)
         until = time.monotonic() + 1.2
         while time.monotonic() < until:
             executor.spin_once(timeout_sec=0.1)

@@ -15,6 +15,7 @@ def source_only(info):
 
 with tarfile.open(destination, 'w:gz') as bundle:
     files = [*root.joinpath('ros2_recorder').glob('*.py'), *root.joinpath('tests').glob('test_*.py')]
+    files += list(root.joinpath('docs').glob('*.md'))
     files += [root / name for name in ('ros2_recorder/assets/icon.svg', 'install.sh', 'launch.sh',
                                      'install_launcher.py', 'make_package.py', 'make_deb.py', 'pyproject.toml', 'README.md', 'INSTALL.md')]
     for path in sorted(files):

@@ -63,6 +63,8 @@ def build(version, output_dir):
         copy(ROOT / 'ros2_recorder/assets/icon.svg', stage / 'usr/share/icons/hicolor/scalable/apps/ros2-recorder.svg')
         for name in ('README.md', 'INSTALL.md'):
             copy(ROOT / name, stage / 'usr/share/doc' / PACKAGE / name)
+        for source in sorted((ROOT / 'docs').glob('*.md')):
+            copy(source, stage / 'usr/share/doc' / PACKAGE / 'docs' / source.name)
         payload = sorted(p for p in stage.rglob('*') if p.is_file())
         installed_kib = (sum(p.stat().st_size for p in payload) + 1023) // 1024
         write('DEBIAN/control', '\n'.join([

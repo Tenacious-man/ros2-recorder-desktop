@@ -34,6 +34,8 @@ from .frequency import FrequencyMonitor
 from .compatibility import detect_capabilities
 from .tasks import Signals, Task
 from .summary_dialog import RecordingSummaryDialog
+from .live_stamp_page import LiveStampPage
+from .item_delegate import TopicItemDelegate
 
 
 def button(text, callback=None, primary=False):
@@ -307,6 +309,8 @@ class MainWindow(QMainWindow):
         self.clear_visible_button.setProperty('compact', True)
         self.topic_table = table(["录制", "话题名称", "消息类型", "发布端", "接收频率", "检测"])
         self.topic_table.setObjectName("topicTable")
+        self.topic_table.setItemDelegate(TopicItemDelegate(self.topic_table))
+        self.topic_table.setStyleSheet('QTableWidget::indicator { width: 20px; height: 20px; }')
         self.topic_table.setMinimumHeight(85)
         self.topic_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.topic_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
@@ -548,6 +552,7 @@ class MainWindow(QMainWindow):
         row.addWidget(button("复用所选配置", self.reuse_session, True))
         row.addWidget(button("打开 bag 目录", lambda: self.open_session_location(False)))
         row.addWidget(button("打开日志与报告目录", lambda: self.open_session_location(True)))
+        row.addWidget(button("离线统计所选 bag", self.analyze_selected_session))
         layout.addLayout(row)
         self.report_details = QPlainTextEdit()
         self.report_details.setReadOnly(True)
@@ -555,13 +560,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.report_details, 1)
 
     def _analysis_page(self, layout):
-        self._heading(layout, "数据分析", "预留入口 · 时间戳与同步检查后续细化")
-        box, content = group("时间戳与同步分析")
-        content.addWidget(text_label("后续分析已有 bag，不依赖录制界面，也不额外占用录制时的数据接收通道。"))
-        content.addWidget(text_label("计划支持：帧间隔与时间跳变、跨话题时间差、时间轴及报告导出。", True))
-        content.addWidget(text_label("分析前需要确定时间来源、话题配对方式和允许误差。当前版本尚未实现此功能。", True))
-        layout.addWidget(box)
-        layout.addStretch()
+        self.analysis_widget = LiveStampPage(self)
+        self.analysis_widget.busyChanged.connect(self._analysis_state_changed)
+        layout.addWidget(self.analysis_widget)
+
+    def _analysis_state_changed(self):
+        self._update_profile_load_controls()
+        self._maybe_close()
+
+    def analyze_selected_session(self):
+        session = self._selected_session()
+        if session and not self._busy_guard():
+            self.nav.setCurrentRow(4)
+            self.analysis_widget.open_bag(session['bag_path'])
 
     def run_task(self, function, result=None, failed=None, log=None):
         task = Task(function, self)
@@ -604,6 +615,8 @@ class MainWindow(QMainWindow):
             return "正在加载或检查消息环境，请等待完成后再操作。"
         if self.benchmark_busy:
             return "正在进行目录写入测速，请等待测速完成后再操作。"
+        if self.analysis_widget.busy:
+            return "时间戳监听或离线分析仍在运行，请先在“数据分析”中停止监听或取消读取后再操作。"
         return ""
 
     def _update_profile_load_controls(self):
@@ -630,6 +643,9 @@ class MainWindow(QMainWindow):
 
     def _navigate(self, index):
         self.stack.setCurrentIndex(index)
+        if not self.pending_close:
+            self.footer.setText('ROS 2  ·  比较各话题最新到达消息的 header.stamp  ·  差值单位：ms' if index == 4 else
+                                'ROS 2  ·  频率为接收端观测值  ·  无告警不代表数据完整')
         if index == 1 and hasattr(self, 'history_root') and not self.history_root.text():
             self.history_root.setText(self.output_root.text())
             self.refresh_history()
@@ -857,6 +873,7 @@ class MainWindow(QMainWindow):
         self.env_status.setText(label)
         self._append(self.environment_log, "已加载：" + label)
         self._render_topics()
+        self._notify_stamp_topics()
         if self.auto_discover and not self.pending_close:
             self.refresh_topics(manual=False)
 
@@ -900,6 +917,7 @@ class MainWindow(QMainWindow):
             self.topics = topics
             self._auto_detect_frequencies()
             self._render_topics()
+            self._notify_stamp_topics()
         def failed(message):
             if finish():
                 return
@@ -948,7 +966,7 @@ class MainWindow(QMainWindow):
             self.topic_table.setItem(row, 4, hz_item)
             reason = ""
             if self.frequency_suspended:
-                state, reason = "已暂停", "录制期间暂停频率检测，停止并保存后恢复。"
+                state, reason = "已暂停", "录制或时间戳监听期间暂停频率检测，结束后恢复。"
             elif self.env_busy or self.build_runner:
                 state, reason = "加载中", "请等待消息环境加载完成。"
             elif topic.get('pending'):
@@ -966,6 +984,12 @@ class MainWindow(QMainWindow):
             self.topic_table.setRowHeight(row, 36)
         self.topic_table.blockSignals(False)
         self._filter_topic_rows()
+
+    def _notify_stamp_topics(self):
+        # Only propagate a new graph result/environment, not incidental redraws
+        # of the recording table (e.g. pausing its frequency subscriptions).
+        if hasattr(self, 'analysis_widget') and hasattr(self.analysis_widget, 'set_discovered_topics'):
+            self.analysis_widget.set_discovered_topics(self.topics)
 
     def _filter_topic_rows(self):
         if not hasattr(self, 'topic_table'):
@@ -1697,11 +1721,11 @@ class MainWindow(QMainWindow):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _maybe_close(self):
-        if self.pending_close and not self.is_recording and not self.build_runner and not self.frequency_monitor and not self.tasks:
+        if self.pending_close and not self.is_recording and not self.build_runner and not self.frequency_monitor and not self.tasks and not self.analysis_widget.busy:
             QTimer.singleShot(0, self.close)
 
     def closeEvent(self, event):
-        busy = self.is_recording or self.build_runner or self.frequency_monitor or self.tasks
+        busy = self.is_recording or self.build_runner or self.frequency_monitor or self.tasks or self.analysis_widget.busy
         if busy:
             if not self.pending_close:
                 if self.is_recording or self.build_runner or self.preflight_busy or self.env_busy or self.benchmark_busy:
@@ -1713,6 +1737,7 @@ class MainWindow(QMainWindow):
                 self.stop_recording()
                 self.cancel_build()
                 self.stop_all_monitors()
+                self.analysis_widget.cancel()
                 self.footer.setText("正在等待后台操作结束，文件写完后退出…")
             event.ignore()
             return
@@ -1720,6 +1745,7 @@ class MainWindow(QMainWindow):
             self.store.save(self.get_config())
         except Exception:
             pass
+        self.analysis_widget.dispose()
         event.accept()
 
 
