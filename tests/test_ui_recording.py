@@ -39,6 +39,9 @@ def test_start_and_stop_from_native_workbench(tmp_path, monkeypatch):
         until(app, lambda: bool(window.active_env) and not window.tasks)
         window.apply_config(RecordConfig(output_root=str(tmp_path / 'bags'), all_topics=False,
                                          topics=['/ui_acceptance'], min_free_gib=0, cache_mib=8), load_env=False)
+        window._append(window.event_log, '上一轮录制的界面日志')
+        window.clear_log_button.click()
+        assert window.event_log.toPlainText() == ''
         window.refresh_topics()
         until(app, lambda: not window.discovery_busy)
         assert '/ui_frequency_a' not in window.monitors
@@ -99,6 +102,13 @@ rclpy.shutdown()
         window.toggle_frequency('/ui_acceptance')
         assert not window.monitors
         assert window._frequency_text('/ui_acceptance') == '检测已暂停'
+        log_path = window.session.session_dir / 'recorder.log'
+        until(app, lambda: log_path.is_file() and log_path.stat().st_size > 0)
+        saved_log = log_path.read_text()
+        window.clear_log_button.click()
+        assert window.event_log.toPlainText() == ''
+        assert log_path.read_text().startswith(saved_log)
+        assert window.is_recording
         go.touch()
         until(app, lambda: sent.exists() or publisher.poll() is not None)
         assert sent.exists(), publisher.stderr.read()
@@ -108,6 +118,8 @@ rclpy.shutdown()
         report = json.loads((window.session.session_dir / 'report.json').read_text())
         assert report['message_count'] == 120
         assert report['status'] == 'completed'
+        assert '录制结束' in window.event_log.toPlainText()
+        assert log_path.read_text().startswith(saved_log)
         assert window.parameter_box.isEnabled()
         assert window.metric_values['state'].text() == '已结束'
         summary = window.recording_summary

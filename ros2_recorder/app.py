@@ -139,6 +139,7 @@ class MainWindow(QMainWindow):
         self.workspace = None
         self.env_busy = False
         self.discovery_busy = False
+        self.discovery_manual = False
         self.discovery_requested = False
         self.last_discovery = 0.0
         self.preflight_busy = False
@@ -156,6 +157,7 @@ class MainWindow(QMainWindow):
         self.frequency_results = {}
         self.topics = []
         self.selected_topics = set()
+        self.manual_topics = set()
         self.sessions = []
         self.metric_busy = False
         self.idle_disk_busy = False
@@ -269,7 +271,8 @@ class MainWindow(QMainWindow):
         self.profile_combo = QComboBox()
         self.profile_combo.setMinimumWidth(180)
         profile_row.addWidget(self.profile_combo, 1)
-        profile_row.addWidget(button("加载", self.load_selected_profile))
+        self.load_profile_button = button("加载", self.load_selected_profile)
+        profile_row.addWidget(self.load_profile_button)
         profile_row.addWidget(button("保存为…", self.save_profile))
         profile_row.addWidget(button("导入命令…", self.import_record_command))
         profile_row.addWidget(button("消息环境", lambda: self.nav.setCurrentRow(2)))
@@ -293,7 +296,7 @@ class MainWindow(QMainWindow):
         self.topic_search.setToolTip('仅筛选显示，不改变勾选状态；搜索结果之外已勾选的话题仍会录制。')
         self.topic_search.textChanged.connect(self._filter_topic_rows)
         selection_row.addWidget(self.topic_search, 1)
-        self.refresh_topics_button = button("刷新话题", self.refresh_topics)
+        self.refresh_topics_button = button("刷新话题", lambda: self.refresh_topics())
         selection_row.addWidget(self.refresh_topics_button)
         self.add_topic_button = button("手动添加…", self.add_topic)
         selection_row.addWidget(self.add_topic_button)
@@ -446,6 +449,14 @@ class MainWindow(QMainWindow):
             self.metric_values[key] = value
         self.metric_values['state'].setText("未开始")
         lower_layout.addLayout(metrics)
+        log_actions = QHBoxLayout()
+        log_actions.addWidget(text_label("录制日志", True))
+        log_actions.addStretch()
+        self.clear_log_button = button("清除日志", self.clear_recording_log)
+        self.clear_log_button.setProperty('compact', True)
+        self.clear_log_button.setToolTip("清空当前界面显示的日志；已保存的日志文件、录制报告和告警计数会保留。")
+        log_actions.addWidget(self.clear_log_button)
+        lower_layout.addLayout(log_actions)
         self.event_log = QPlainTextEdit()
         self.event_log.setReadOnly(True)
         self.event_log.setMaximumBlockCount(3000)
@@ -511,7 +522,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.profile_list)
         row = QHBoxLayout()
         row.addWidget(button("保存当前配置…", self.save_profile, True))
-        row.addWidget(button("加载所选配置", self.load_profile_from_list))
+        self.load_profile_from_list_button = button("加载所选配置", self.load_profile_from_list)
+        row.addWidget(self.load_profile_from_list_button)
         row.addWidget(button("导出 JSON…", self.export_profile))
         row.addWidget(button("导入 JSON…", self.import_profile))
         row.addWidget(button("删除所选配置…", self.delete_profile))
@@ -563,22 +575,52 @@ class MainWindow(QMainWindow):
             if task in self.tasks:
                 self.tasks.remove(task)
             task.deleteLater()
+            self._update_profile_load_controls()
             self._maybe_close()
         task.ended.connect(ended)
         task.start()
+        self._update_profile_load_controls()
         return task
 
     def _append(self, editor, text):
         editor.appendPlainText(f"{datetime.now():%H:%M:%S}  {text}")
+
+    def clear_recording_log(self):
+        self.event_log.clear()
 
     def _error(self, message):
         self._append(self.event_log, message)
         if not self.pending_close:
             QMessageBox.warning(self, "操作未完成", message)
 
+    def _busy_message(self):
+        if self.is_recording:
+            return "录制尚未结束，请先停止并保存后再操作。"
+        if self.preflight_busy:
+            return "正在准备录制，请等待准备完成后再操作。"
+        if self.build_runner:
+            return "正在编译消息包，请等待编译完成或取消后再操作。"
+        if self.env_busy:
+            return "正在加载或检查消息环境，请等待完成后再操作。"
+        if self.benchmark_busy:
+            return "正在进行目录写入测速，请等待测速完成后再操作。"
+        return ""
+
+    def _update_profile_load_controls(self):
+        if not hasattr(self, 'load_profile_from_list_button'):
+            return
+        message = self._busy_message()
+        self.profile_combo.setEnabled(not message)
+        self.load_profile_button.setEnabled(not message)
+        self.load_profile_from_list_button.setEnabled(not message)
+        self.load_profile_button.setText("加载中…" if self.env_busy else "加载")
+        self.load_profile_button.setToolTip(message or "应用配置方案；相同的消息环境会直接复用。")
+        self.load_profile_from_list_button.setToolTip(message)
+
     def _busy_guard(self):
-        if self.is_recording or self.preflight_busy or self.env_busy or self.build_runner or self.benchmark_busy:
-            self._error("请先结束当前录制、编译、环境加载或测速操作。")
+        message = self._busy_message()
+        if message:
+            self._error(message)
             return True
         return False
 
@@ -678,9 +720,11 @@ class MainWindow(QMainWindow):
     def apply_config(self, config, *, load_env=True):
         self.output_root.setText(config.output_root)
         self.prefix.setText(config.prefix)
-        self.selected_topics = set(config.topics)
-        if config.all_topics or config.regex or config.exclude:
-            self._append(self.event_log, '旧配置的全部话题/正则/排除规则已停用，请在列表中勾选本次要录制的话题。')
+        # Older profiles used implicit scopes instead of an explicit selection.
+        # Apply their parameters without clearing the user's current checkboxes
+        # or silently enabling an obsolete recording scope.
+        if not (config.all_topics or config.regex or config.exclude):
+            self.selected_topics = set(config.topics)
         self.storage.setCurrentText(config.storage)
         self._storage_changed()
         self.preset.setCurrentText(config.preset or "默认")
@@ -711,7 +755,14 @@ class MainWindow(QMainWindow):
                 self.stop_all_monitors()
                 self._initialize_environment(config)
             else:
-                self._request_environment(config.environment_setup, config.workspace, config.packages)
+                same_environment = (self.active_env is not None
+                                    and config.environment_setup == self.loaded_setup
+                                    and config.workspace == self.active_workspace
+                                    and sorted(config.packages) == sorted(self.active_packages))
+                if same_environment:
+                    self._auto_frequency_changed(self.auto_frequency.isChecked())
+                else:
+                    self._request_environment(config.environment_setup, config.workspace, config.packages)
         elif self.active_env:
             self._auto_frequency_changed(self.auto_frequency.isChecked())
 
@@ -807,28 +858,41 @@ class MainWindow(QMainWindow):
         self._append(self.environment_log, "已加载：" + label)
         self._render_topics()
         if self.auto_discover and not self.pending_close:
-            self.refresh_topics()
+            self.refresh_topics(manual=False)
 
-    def refresh_topics(self):
+    def refresh_topics(self, *, manual=True):
         if self.pending_close or self.frequency_suspended or self.is_recording or self.preflight_busy:
             return
-        if not self.active_env or self.discovery_busy or self.env_busy or self.build_runner:
+        if self.discovery_busy:
+            if manual:
+                # A manual click can join an already running background probe.
+                self.discovery_manual = True
+                self.refresh_topics_button.setEnabled(False)
+                self.refresh_topics_button.setText("正在发现…")
+            else:
+                self.discovery_requested = True
+            return
+        if not self.active_env or self.env_busy or self.build_runner:
             self.discovery_requested = True
             return
         self.discovery_requested = False
         self.discovery_busy = True
+        self.discovery_manual = manual
         self.last_discovery = time.monotonic()
-        self.refresh_topics_button.setEnabled(False)
-        self.refresh_topics_button.setText("正在发现…")
+        if manual:
+            self.refresh_topics_button.setEnabled(False)
+            self.refresh_topics_button.setText("正在发现…")
         env = dict(self.active_env)
         hidden = self.include_hidden.isChecked()
         def finish():
+            manual_requested = self.discovery_manual
             self.discovery_busy = False
+            self.discovery_manual = False
             self.refresh_topics_button.setEnabled(True)
             self.refresh_topics_button.setText("刷新话题")
             stale = env != self.active_env or hidden != self.include_hidden.isChecked()
             if (stale or self.discovery_requested) and not self.pending_close:
-                QTimer.singleShot(0, self.refresh_topics)
+                QTimer.singleShot(0, lambda: self.refresh_topics(manual=manual_requested))
             return stale or self.pending_close
         def done(topics):
             if finish():
@@ -848,6 +912,12 @@ class MainWindow(QMainWindow):
             return
         self.topic_table.blockSignals(True)
         rows = {t['name']: t for t in self.topics}
+        # Only explicit manual additions get offline rows. Saved profile
+        # selections remain separate from the currently displayed topic list.
+        for name in self.manual_topics:
+            rows.setdefault(name, {"name": name, "types": ["手动添加，未发现"], "publishers": 0,
+                                   "available": True, "pending": True,
+                                   "reason": "手动添加的话题尚未发现；发现后会自动显示真实消息类型。取消勾选可取消录制。"})
         self.display_topics = [rows[k] for k in sorted(rows)]
         self.topic_table.setRowCount(len(rows))
         for row, topic in enumerate(self.display_topics):
@@ -910,8 +980,8 @@ class MainWindow(QMainWindow):
             visible += show
             hidden_selected += not show and topic['name'] in self.selected_topics
         if hasattr(self, 'topic_count'):
-            discovered_selected = sum(t['name'] in self.selected_topics for t in self.display_topics)
-            message = f'显示 {visible}/{len(self.display_topics)} · 已勾选 {discovered_selected}'
+            listed_selected = sum(t['name'] in self.selected_topics for t in self.display_topics)
+            message = f'显示 {visible}/{len(self.display_topics)} · 已勾选 {listed_selected}'
             if hidden_selected:
                 message += f'（含搜索结果外 {hidden_selected} 个）'
             self.topic_count.setText(message)
@@ -951,9 +1021,10 @@ class MainWindow(QMainWindow):
                 self._error("请填写以 / 开头且没有空格的话题名称")
                 return
             self.selected_topics.add(name)
+            self.manual_topics.add(name)
             self._render_topics()
             if not any(t['name'] == name for t in self.topics):
-                self._append(self.event_log, f"已加入录制选择：{name}；当前未发现该话题，发现后会显示并自动勾选。")
+                self._append(self.event_log, f"已加入录制选择：{name}；列表已标记为“手动添加，未发现”，发现后会自动更新消息类型。")
 
     def toggle_frequency(self, name):
         if self.frequency_suspended:
@@ -1182,6 +1253,7 @@ class MainWindow(QMainWindow):
         self.build_runner = ProcessRunner(argv, dict(self.base_env), cwd=str(build_workspace.build_root),
                                           line=self.build_signals.line.emit, done=self.signals.build_done.emit)
         self.build_runner.start()
+        self._update_profile_load_controls()
 
     def _build_log(self, line):
         self._append(self.environment_log, line)
@@ -1194,6 +1266,7 @@ class MainWindow(QMainWindow):
 
     def _build_done(self, code):
         self.build_runner = None
+        self._update_profile_load_controls()
         self.cancel_build_button.setEnabled(False)
         self.build_button.setEnabled(True)
         if code == 0 and not self.pending_close and not self.build_cancelled:
@@ -1313,6 +1386,7 @@ class MainWindow(QMainWindow):
         self.select_visible_button.setEnabled(not recording)
         self.clear_visible_button.setEnabled(not recording)
         self.add_topic_button.setEnabled(not recording)
+        self._update_profile_load_controls()
         self._render_topics()
 
     def stop_recording(self):
@@ -1370,7 +1444,7 @@ class MainWindow(QMainWindow):
                 and not self.preflight_busy and not self.frequency_suspended
                 and not self.env_busy and not self.build_runner and not self.discovery_busy
                 and self.active_env and time.monotonic() - self.last_discovery > 5):
-            self.refresh_topics()
+            self.refresh_topics(manual=False)
         if not self.is_recording and not self.idle_disk_busy and not self.pending_close and time.monotonic() - self.last_idle_disk > 5:
             self.idle_disk_busy = True
             self.last_idle_disk = time.monotonic()
@@ -1485,6 +1559,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("请先保存或选择一个配置方案")
             self.apply_config(RecordConfig.from_dict(self.store.profiles[name]))
             self.nav.setCurrentRow(0)
+            self._append(self.event_log, f"已应用配置方案：{name}；录制话题按当前勾选执行。")
         except Exception as exc:
             self._error(str(exc))
 
