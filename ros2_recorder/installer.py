@@ -19,7 +19,7 @@ from .environment import installed_environments, load_environment, saved_underla
 
 DEFAULT_ROS = {'focal': 'foxy', 'jammy': 'humble', 'noble': 'jazzy'}
 COMMON_PACKAGES = (
-    'python3', 'python3-pyqt5', 'python3-pyqt5.qtsvg', 'python3-yaml',
+    'python3', 'python3-pyqt5', 'python3-pyqt5.qtsvg', 'python3-yaml', 'python3-numpy',
     'python3-colcon-common-extensions', 'build-essential', 'cmake',
     'desktop-file-utils', 'libxcb-xinerama0', 'libxkbcommon-x11-0',
     'fonts-noto-cjk',

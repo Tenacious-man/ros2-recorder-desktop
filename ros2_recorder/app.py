@@ -36,6 +36,8 @@ from .tasks import Signals, Task
 from .summary_dialog import RecordingSummaryDialog
 from .live_stamp_page import LiveStampPage
 from .item_delegate import TopicItemDelegate
+from .admin_access import AdminCredentials
+from .admin_ui import AdminEntryLabel, AdminPasswordDialog
 
 
 def button(text, callback=None, primary=False):
@@ -122,6 +124,10 @@ def size_text(value):
     return f"{value / MIB:.1f} MiB"
 
 
+def disk_space_text(value):
+    return f"{value / 1_000_000_000:.2f} GB"
+
+
 class MainWindow(QMainWindow):
     def __init__(self, *, auto_discover=True):
         super().__init__()
@@ -166,6 +172,11 @@ class MainWindow(QMainWindow):
         self.last_idle_disk = 0
         self.pending_close = False
         self.stop_time = None
+        self.admin_credentials = AdminCredentials()
+        self.admin_unlocked = False
+        self.admin_dialog = None
+        self.admin_rows = []
+        self.calibration_widget = None
         self.signals = Signals(self)
         self.signals.line.connect(self._record_line)
         self.signals.done.connect(self._record_done)
@@ -208,9 +219,10 @@ class MainWindow(QMainWindow):
         header.setObjectName("appHeader")
         top = QHBoxLayout(header)
         top.setContentsMargins(22, 15, 22, 15)
-        brand = QLabel("◉  ROS Recorder")
-        brand.setObjectName("brand")
-        top.addWidget(brand)
+        self.brand = AdminEntryLabel("◉  ROS Recorder")
+        self.brand.setObjectName("brand")
+        self.brand.activated.connect(self._open_admin)
+        top.addWidget(self.brand)
         top.addStretch()
         self.header_env = text_label("正在检测 ROS 2 环境…", True)
         top.addWidget(self.header_env)
@@ -237,10 +249,6 @@ class MainWindow(QMainWindow):
             builder(layout)
             self.stack.addWidget(page)
         outer.addLayout(middle, 1)
-        self.footer = QLabel("ROS 2  ·  频率为接收端观测值  ·  无告警不代表数据完整")
-        self.footer.setObjectName("footer")
-        self.footer.setMargin(12)
-        outer.addWidget(self.footer)
         self.setCentralWidget(root)
         self.nav.setCurrentRow(0)
 
@@ -249,6 +257,85 @@ class MainWindow(QMainWindow):
         label.setObjectName("pageTitle")
         layout.addWidget(label)
         layout.addWidget(text_label(subtitle, True))
+
+    def _open_admin(self):
+        if self.admin_unlocked:
+            self.nav.setCurrentRow(self.admin_rows[-1])
+            return
+        self._show_admin_password("unlock" if self.admin_credentials.configured else "setup")
+
+    def _show_admin_password(self, mode):
+        if mode == "change" and not self.admin_unlocked:
+            return
+        if self.admin_dialog is not None:
+            self.admin_dialog.raise_()
+            self.admin_dialog.activateWindow()
+            return
+        dialog = AdminPasswordDialog(self.admin_credentials, mode, self)
+        self.admin_dialog = dialog
+        if mode != "change":
+            dialog.accepted.connect(self._unlock_admin)
+        dialog.finished.connect(lambda _result: self._admin_dialog_finished(dialog))
+        dialog.open()
+
+    def _admin_dialog_finished(self, dialog):
+        if self.admin_dialog is dialog:
+            self.admin_dialog = None
+        dialog.deleteLater()
+
+    def _unlock_admin(self):
+        self.admin_unlocked = True
+        if not self.admin_rows:
+            for title, subtitle in (
+                ("设备授时", "管理员功能 · 尚未接入硬件授时；后续按设备型号和网口适配。"),
+                ("点云标定", "双点云手动外参标定"),
+                ("管理员设置", "管理员模式仅对本次运行有效，退出或重启后自动隐藏功能入口。"),
+            ):
+                page = QWidget()
+                layout = QVBoxLayout(page)
+                layout.setContentsMargins(16, 12, 16, 12)
+                layout.setSpacing(8)
+                if title == "点云标定":
+                    try:
+                        from .calibration_page import CalibrationPage
+                        self.calibration_widget = CalibrationPage(self)
+                        self.calibration_widget.busyChanged.connect(self._analysis_state_changed)
+                        layout.addWidget(self.calibration_widget)
+                    except ImportError:
+                        self._heading(layout, title, "标定依赖未安装。请安装 python3-numpy 后重启软件。")
+                else:
+                    self._heading(layout, title, subtitle)
+                if title == "管理员设置":
+                    actions = QHBoxLayout()
+                    actions.addWidget(button("修改管理员密码…", lambda: self._show_admin_password("change")))
+                    actions.addWidget(button("退出管理员模式", self._lock_admin))
+                    actions.addStretch()
+                    layout.addLayout(actions)
+                if title != "点云标定":
+                    layout.addStretch()
+                row = self.stack.addWidget(page)
+                item = QListWidgetItem(title)
+                item.setSizeHint(QSize(140, 48))
+                self.nav.addItem(item)
+                self.admin_rows.append(row)
+        for row in self.admin_rows:
+            self.nav.item(row).setHidden(False)
+            self.stack.widget(row).setEnabled(True)
+        if self.calibration_widget:
+            self.calibration_widget.update_controls()
+        self.nav.setCurrentRow(self.admin_rows[-1])
+
+    def _lock_admin(self):
+        self.admin_unlocked = False
+        if self.calibration_widget:
+            self.calibration_widget.set_active(False)
+        if self.admin_dialog is not None:
+            self.admin_dialog.reject()
+        if self.stack.currentIndex() >= 5:
+            self.nav.setCurrentRow(0)
+        for row in self.admin_rows:
+            self.nav.item(row).setHidden(True)
+            self.stack.widget(row).setEnabled(False)
 
     def _record_page(self, layout):
         title_row = QHBoxLayout()
@@ -617,6 +704,8 @@ class MainWindow(QMainWindow):
             return "正在进行目录写入测速，请等待测速完成后再操作。"
         if self.analysis_widget.busy:
             return "时间戳监听或离线分析仍在运行，请先在“数据分析”中停止监听或取消读取后再操作。"
+        if self.calibration_widget and self.calibration_widget.busy:
+            return "标定订阅尚未结束；离开标定页面后会自动停止，请稍候再操作。"
         return ""
 
     def _update_profile_load_controls(self):
@@ -629,6 +718,8 @@ class MainWindow(QMainWindow):
         self.load_profile_button.setText("加载中…" if self.env_busy else "加载")
         self.load_profile_button.setToolTip(message or "应用配置方案；相同的消息环境会直接复用。")
         self.load_profile_from_list_button.setToolTip(message)
+        if self.calibration_widget:
+            self.calibration_widget.update_controls()
 
     def _busy_guard(self):
         message = self._busy_message()
@@ -642,10 +733,12 @@ class MainWindow(QMainWindow):
         return self.session is not None and not self.session.finished
 
     def _navigate(self, index):
+        if index >= 5 and not self.admin_unlocked:
+            self.nav.setCurrentRow(0)
+            return
         self.stack.setCurrentIndex(index)
-        if not self.pending_close:
-            self.footer.setText('ROS 2  ·  比较各话题最新到达消息的 header.stamp  ·  差值单位：ms' if index == 4 else
-                                'ROS 2  ·  频率为接收端观测值  ·  无告警不代表数据完整')
+        if self.calibration_widget:
+            self.calibration_widget.set_active(index == 6)
         if index == 1 and hasattr(self, 'history_root') and not self.history_root.text():
             self.history_root.setText(self.output_root.text())
             self.refresh_history()
@@ -1481,8 +1574,8 @@ class MainWindow(QMainWindow):
             def space_done(free):
                 self.idle_disk_busy = False
                 if not self.is_recording:
-                    self.metric_values['free'].setText(size_text(free))
-                    self.metric_values['free'].setToolTip("保存目录尚不存在时，显示最近已存在父目录的可用空间。")
+                    self.metric_values['free'].setText(disk_space_text(free))
+                    self.metric_values['free'].setToolTip("按十进制 GB 显示（1 GB = 1,000,000,000 字节）。保存目录尚不存在时，显示最近已存在父目录的可用空间。")
             def space_failed(_):
                 self.idle_disk_busy = False
             if raw:
@@ -1500,7 +1593,7 @@ class MainWindow(QMainWindow):
                 self.metric_values['time'].setText(f"{duration // 3600:02}:{duration // 60 % 60:02}:{duration % 60:02}")
                 self.metric_values['size'].setText(size_text(values['size']))
                 self.metric_values['growth'].setText(f"{values['growth_bytes_per_sec'] / MIB:.1f} MiB/s")
-                self.metric_values['free'].setText(size_text(values['free']))
+                self.metric_values['free'].setText(disk_space_text(values['free']))
                 self.metric_values['warnings'].setText(str(values['warning_count']))
                 if session.stopped and not session.finished:
                     self.stop_time = self.stop_time or time.monotonic()
@@ -1721,11 +1814,11 @@ class MainWindow(QMainWindow):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _maybe_close(self):
-        if self.pending_close and not self.is_recording and not self.build_runner and not self.frequency_monitor and not self.tasks and not self.analysis_widget.busy:
+        if self.pending_close and not self.is_recording and not self.build_runner and not self.frequency_monitor and not self.tasks and not self.analysis_widget.busy and not (self.calibration_widget and self.calibration_widget.busy):
             QTimer.singleShot(0, self.close)
 
     def closeEvent(self, event):
-        busy = self.is_recording or self.build_runner or self.frequency_monitor or self.tasks or self.analysis_widget.busy
+        busy = self.is_recording or self.build_runner or self.frequency_monitor or self.tasks or self.analysis_widget.busy or (self.calibration_widget and self.calibration_widget.busy)
         if busy:
             if not self.pending_close:
                 if self.is_recording or self.build_runner or self.preflight_busy or self.env_busy or self.benchmark_busy:
@@ -1738,7 +1831,9 @@ class MainWindow(QMainWindow):
                 self.cancel_build()
                 self.stop_all_monitors()
                 self.analysis_widget.cancel()
-                self.footer.setText("正在等待后台操作结束，文件写完后退出…")
+                if self.calibration_widget:
+                    self.calibration_widget.set_active(False)
+                self.setWindowTitle("ROS Recorder · ROS 2 · 正在等待后台操作结束…")
             event.ignore()
             return
         try:
@@ -1746,6 +1841,8 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.analysis_widget.dispose()
+        if self.calibration_widget:
+            self.calibration_widget.dispose()
         event.accept()
 
 
@@ -1771,7 +1868,6 @@ def configure_style(app):
         #navigation { background: #ffffff; border: 0; border-right: 1px solid #e0e5ec; padding: 15px 8px; outline: 0; }
         #navigation::item { padding: 14px 9px; margin-bottom: 4px; border-radius: 6px; }
         #navigation::item:selected { background: #e4f2ee; color: #176963; }
-        #footer { background: #ffffff; color: #6b7788; border-top: 1px solid #e0e5ec; font-size: 12px; }
         QLabel[secondary=true] { color: #657286; font-size: 12px; }
         QGroupBox { background: #ffffff; border: 1px solid #e0e5ec; border-radius: 8px; margin-top: 10px; padding: 17px 10px 10px; }
         QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; color: #344054; font-weight: 500; }

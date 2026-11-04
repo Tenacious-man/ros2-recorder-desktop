@@ -33,6 +33,7 @@ def test_deb_metadata_payload_permissions_and_checksums(deb_bundle):
     assert field('Version') == f'{__version__}-1'
     assert field('Architecture') == 'all'
     assert 'python3-pyqt5' in field('Depends') and 'python3-yaml' in field('Depends')
+    assert 'python3-numpy' in field('Depends')
     assert 'humble' not in field('Depends') and 'jazzy' not in field('Depends')
     for name in ('ros2-recorder', 'ros2-recorder-setup'):
         command = extracted / 'usr/bin' / name

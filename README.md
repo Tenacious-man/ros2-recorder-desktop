@@ -4,7 +4,7 @@
 
 ## 启动
 
-使用 deb 安装包时，在包所在目录运行 `sudo apt install ./ros2-recorder-desktop_0.3.2-1_all.deb`，然后在应用菜单搜索“ROS 2 录制工作台”，或运行 `ros2-recorder`。需要补齐 ROS 组件时运行 `ros2-recorder-setup`，没有 ROS 2 则运行 `ros2-recorder-setup --install-ros`。deb 不包含 ROS 2 本体、设备驱动或自定义消息源码。完整迁移步骤见 [安装说明](INSTALL.md)。
+使用 deb 安装包时，在包所在目录运行 `sudo apt install ./ros2-recorder-desktop_0.4.0-1_all.deb`，然后在应用菜单搜索“ROS 2 录制工作台”，或运行 `ros2-recorder`。需要补齐 ROS 组件时运行 `ros2-recorder-setup`，没有 ROS 2 则运行 `ros2-recorder-setup --install-ros`。deb 不包含 ROS 2 本体、设备驱动或自定义消息源码。完整迁移步骤见 [安装说明](INSTALL.md)，本次改动见 [v0.4.0 发布说明](docs/release-notes.md)。
 
 首次安装或补齐依赖，在软件目录运行：
 
@@ -28,7 +28,9 @@
 
 主界面随窗口大小调整，不使用整页滚动条。话题列表与日志分别在区域内滚动；拖动两者之间的分隔条可调整高度。右侧录制配置独立滚动，展开高级参数不会把开始/停止按钮或状态挤出窗口。长环境路径和录制路径会缩略显示，悬停可查看完整内容。
 
-其他机器所需组件：`python3-pyqt5`（5.14 及以上）、`python3-yaml`、`python3-colcon-common-extensions`，以及目标 ROS 2 发行版的 rosbag2；使用 MCAP 还需该环境支持并安装相应存储插件。建议使用系统 `/usr/bin/python3`，避免 ROS 二进制包与虚拟环境不兼容。软件不包含 ROS 2 本体。
+“目录剩余空间”使用十进制 GB 显示（1 GB = 1,000,000,000 字节），便于与文件管理器对照。
+
+其他机器所需组件：`python3-pyqt5`（5.14 及以上）、`python3-yaml`、`python3-numpy`、`python3-colcon-common-extensions`，以及目标 ROS 2 发行版的 rosbag2；使用 MCAP 还需该环境支持并安装相应存储插件。建议使用系统 `/usr/bin/python3`，避免 ROS 二进制包与虚拟环境不兼容。软件不包含 ROS 2 本体。
 
 ## 环境与版本适配
 
@@ -86,7 +88,7 @@
 
 “导出”生成 JSON 汇总和同名 `_anomalies.csv`，保留时间来源、整数纳秒、对应 bag 时间等信息。异常 CSV 记录重复时间和读取顺序中的 header 时间倒退；界面不再要求设置期望频率和间断阈值。没有异常时仍生成 CSV 表头。导出文件先写临时文件再替换，两个输出文件不构成跨文件原子事务，失败时按提示重新导出。
 
-读取失败或取消保留上次成功结果；打开另一份数据会清除旧结果。首版录制、环境变更与分析互斥，退出时取消分析并清理进程。任意嵌套消息字段 / 数组的通用对比尚未加入；ROS 回放、图像 / 点云预览和标定继续按 [后续计划](docs/analysis-roadmap.md) 实施。
+读取失败或取消保留上次成功结果；打开另一份数据会清除旧结果。首版录制、环境变更与分析互斥，退出时取消分析并清理进程。任意嵌套消息字段 / 数组的通用对比尚未加入；点云手动标定见 [点云标定说明](docs/manual-calibration.md)，其余预览和标定扩展见 [后续计划](docs/analysis-roadmap.md)。
 
 ## 频率、缓存与完整性
 
@@ -122,6 +124,12 @@
 
 命名方案与上次配置：`~/.config/ros2-recorder/profiles.json`（遵循 `XDG_CONFIG_HOME`）。
 
+管理员入口：连续点击左上角“ROS Recorder”六次（相邻点击不超过 1.5 秒，点击其他位置会重置计数）。首次进入需设置至少 6 个字符的密码，以后验证密码后进入管理员设置，并在“数据分析”下方显示“设备授时”“点云标定”“管理员设置”。设备授时目前为预留说明页；点云标定已集成双 PointCloud2 手动外参调整，直接订阅 ROS 2 话题，无内置播放器，无需启动旧 RViz 工具。管理员设置可修改密码或退出，重启后也会隐藏这些入口。
+
+标定操作与旧 INI 兼容规则见 [手动标定说明](docs/manual-calibration.md)。标定页会在后台自动刷新点云话题，保留手动刷新按钮；选择某一路后自动订阅，切换或清空选择自动更新订阅。暂停由外部播放器或数据源控制。离开标定页或退出管理员模式时自动停止订阅；订阅期间暂停原频率检测，并阻止启动录制或切换消息环境，停止后恢复。
+
+管理员密码使用随机盐和 PBKDF2-SHA256 摘要，保存在 `~/.config/ros2-recorder/admin.json`（遵循 `XDG_CONFIG_HOME`），不保存明文，不随录制配置导出。这是本机应用内的入口保护，不能限制拥有本机账户或配置文件修改权限的人员。
+
 安装配置：`~/.config/ros2-recorder/installation.json`。未加载 ROS 2 且未指定其他环境时，用作基础环境选择；已有录制配置中的显式环境选择仍保留。
 
 消息编译输出：`~/.cache/ros2-recorder/workspaces/源目录标识/builds/本次构建标识/`（遵循 `XDG_CACHE_HOME`）。每次使用新构建目录，失败的编译不覆盖先前已加载的结果；配置引用的构建目录需要保留。
@@ -137,6 +145,10 @@
 - `processes.py`：进程组管理与停止信号。
 - `recording.py`：录制会话、配置快照、空间监控、元数据报告。
 - `app.py` / `tasks.py`：桌面界面和后台任务桥接。
+- `admin_access.py` / `admin_ui.py`：本地管理员密码、隐藏入口及密码窗口。
+- `calibration_page.py` / `calibration_view.py`：管理员点云标定页、内置三维点云视图与选点属性。
+- `calibration_math.py` / `calibration_cloud.py`：外参、旧 INI 厘米换算、PointCloud2 字段及行填充处理。
+- `calibration_monitor.py` / `calibration_probe.py`：独立 ROS 订阅进程与有限点数预览；不发布点云或外参话题。
 - `latest_stamps.py` / `stamp_probe.py` / `live_stamp_page.py`：最新到达消息的 header 订阅、基准差值与实时表格。
 - `header_stamp.py`：复用 ROS 原生时间解码器的前缀提取和安全回退。
 - `analysis.py`：独立进程中的只读 bag 读取、header 解码、流式统计、时间戳索引和异常 CSV 生成。

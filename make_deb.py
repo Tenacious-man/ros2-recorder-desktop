@@ -71,7 +71,7 @@ def build(version, output_dir):
             f'Package: {PACKAGE}', f'Version: {version}', 'Section: utils', 'Priority: optional',
             'Architecture: all', 'Maintainer: ROS Recorder contributors <ros2-recorder@localhost>',
             f'Installed-Size: {installed_kib}',
-            'Depends: bash, python3 (>= 3.8), python3-pyqt5 (>= 5.14), python3-pyqt5.qtsvg, python3-yaml (>= 5.3)',
+            'Depends: bash, python3 (>= 3.8), python3-pyqt5 (>= 5.14), python3-pyqt5.qtsvg, python3-yaml (>= 5.3), python3-numpy (>= 1.17)',
             'Recommends: fonts-noto-cjk, python3-colcon-common-extensions, build-essential, cmake',
             'Description: ROS 2 recording workbench',
             ' Chinese desktop interface for rosbag2 recording, topic frequency monitoring,',
