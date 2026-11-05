@@ -32,38 +32,47 @@ class FrequencyWindow:
                 "jitter_ms": math.sqrt(sum((v - mean)**2 for v in intervals) / len(intervals)) * 1000 if intervals else None}
 
 
+def subscription_qos(node, topic):
+    """Request Reliable only when every discovered publisher explicitly offers it."""
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    publishers = node.get_publishers_info_by_topic(topic)
+    reliable = bool(publishers) and all(
+        p.qos_profile.reliability == ReliabilityPolicy.RELIABLE for p in publishers)
+    policy = ReliabilityPolicy.RELIABLE if reliable else ReliabilityPolicy.BEST_EFFORT
+    return QoSProfile(depth=10, reliability=policy)
+
+
 def watch_topics(node, executor, context, control):
     import rclpy
-    from rclpy.qos import qos_profile_sensor_data
     from rosidl_runtime_py.utilities import get_message
     subscriptions, windows, requested = {}, {}, {}
-    stamp, last_report, last_control = None, time.monotonic(), 0
+    last_report, last_control = time.monotonic(), 0
     while rclpy.ok(context=context):
         now = time.monotonic()
-        if now - last_control >= .2:
+        if now - last_control >= 1:
             last_control = now
-            current = control.stat().st_mtime_ns
-            if current != stamp:
-                desired = json.loads(control.read_text())['topics']
-                for name in list(requested):
-                    if desired.get(name) != requested[name]:
-                        if name in subscriptions:
-                            node.destroy_subscription(subscriptions.pop(name))
-                        windows.pop(name, None)
-                        requested.pop(name)
-                for name, message_type in desired.items():
-                    if name in requested:
-                        continue
-                    requested[name] = message_type
-                    try:
-                        window = FrequencyWindow()
-                        subscriptions[name] = node.create_subscription(
-                            get_message(message_type), name, window.received,
-                            qos_profile_sensor_data, raw=True)
-                        windows[name] = window
-                    except Exception as exc:
-                        emit({"topic": name, "error": str(exc)})
-                stamp = current
+            desired = json.loads(control.read_text())['topics']
+            targets = {name: (message_type, subscription_qos(node, name))
+                       for name, message_type in desired.items()}
+            for name in list(requested):
+                target = targets.get(name)
+                signature = (target[0], target[1].reliability) if target else None
+                if signature != requested[name]:
+                    if name in subscriptions:
+                        node.destroy_subscription(subscriptions.pop(name))
+                    windows.pop(name, None)
+                    requested.pop(name)
+            for name, (message_type, qos) in targets.items():
+                if name in requested:
+                    continue
+                requested[name] = (message_type, qos.reliability)
+                try:
+                    window = FrequencyWindow()
+                    subscriptions[name] = node.create_subscription(
+                        get_message(message_type), name, window.received, qos, raw=True)
+                    windows[name] = window
+                except Exception as exc:
+                    emit({"topic": name, "error": str(exc)})
         try:
             executor.spin_once(timeout_sec=.05)
         except rclpy.executors.ExternalShutdownException:
@@ -71,7 +80,8 @@ def watch_topics(node, executor, context, control):
         now = time.monotonic()
         if now - last_report >= 1:
             for name, window in windows.items():
-                emit({"topic": name, **window.sample(now)})
+                emit({"topic": name, "subscription_reliability": requested[name][1].name,
+                      **window.sample(now)})
             last_report = now
     return 0
 
@@ -135,7 +145,7 @@ def main():
             raise ValueError("消息类型未加载：" + topic['reason'])
         window = FrequencyWindow()
         node.create_subscription(get_message(topic['types'][0]), args.topic, window.received,
-                                 qos_profile_sensor_data, raw=True)
+                                 subscription_qos(node, args.topic), raw=True)
         last_report = time.monotonic()
         while rclpy.ok(context=context):
             try:

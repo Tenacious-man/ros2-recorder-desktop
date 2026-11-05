@@ -34,7 +34,10 @@ class RecordConfig:
     compression_queue: int = 4
     compression_threads: int = 0
     qos_path: str = ""
+    qos_enabled: bool = True
+    recording_reliability: str = "auto"
     storage_config: str = ""
+    storage_config_enabled: bool = True
     include_hidden: bool = False
     use_sim_time: bool = False
     min_free_gib: float = 5.0
@@ -71,6 +74,13 @@ class RecordConfig:
                 valid = isinstance(value, type(default))
             if not valid:
                 raise ValueError(f"配置字段 {f.name} 类型错误")
+        if self.recording_reliability not in {"auto", "reliable", "best_effort"}:
+            raise ValueError("录制可靠性无效")
+        if self.recording_reliability != "auto":
+            if self.qos_enabled and self.qos_path:
+                raise ValueError("指定录制可靠性不能同时使用自定义 QoS YAML；请选择自动适配以使用 YAML")
+            if self.all_topics or self.regex:
+                raise ValueError("指定录制可靠性需要使用明确的话题列表")
         if not self.output_root.strip():
             raise ValueError("请选择保存目录")
         if any(not isinstance(p, str) or not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]*", p) for p in self.packages):
@@ -121,6 +131,8 @@ class RecordConfig:
 
     def argv(self, output: Path | str) -> list[str]:
         self.validate()
+        if self.recording_reliability != "auto":
+            raise ValueError("请先生成录制 QoS 配置文件")
         args = ["ros2", "bag", "record", "-o", str(output), "-s", self.storage,
                 "--max-cache-size", str(self.cache_bytes if self.cache_bytes >= 0 else self.cache_mib * MIB),
                 "--max-bag-size", str(self.split_bytes if self.split_bytes >= 0 else self.split_mib * MIB),
@@ -132,8 +144,8 @@ class RecordConfig:
         else:
             args += self.topics
         for flag, value in (("--exclude", self.exclude), ("--storage-preset-profile", self.preset),
-                            ("--qos-profile-overrides-path", self.qos_path),
-                            ("--storage-config-file", self.storage_config)):
+                            ("--qos-profile-overrides-path", self.qos_path if self.qos_enabled else ""),
+                            ("--storage-config-file", self.storage_config if self.storage_config_enabled else "")):
             if value:
                 args += [flag, value]
         if self.compression != "none":

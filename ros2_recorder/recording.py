@@ -28,7 +28,8 @@ def folder_size(path: Path) -> int:
 
 
 def validate_files(config: RecordConfig):
-    for label, raw in (("QoS", config.qos_path), ("存储", config.storage_config)):
+    for label, raw in (("QoS", config.qos_path if config.qos_enabled else ""),
+                       ("存储", config.storage_config if config.storage_config_enabled else "")):
         if not raw:
             continue
         path = Path(raw).expanduser().resolve()
@@ -37,6 +38,31 @@ def validate_files(config: RecordConfig):
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError(f"{label} 配置必须是 YAML 对象")
+
+
+def prepare_recording_qos(config, directory):
+    """Materialize explicit-topic overrides; leave automatic/custom YAML behavior intact."""
+    config.validate()
+    if config.recording_reliability == 'auto':
+        return config
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / 'recording_qos.yaml'
+    payload = {name: {'reliability': config.recording_reliability,
+                      'history': 'keep_last', 'depth': 10}
+               for name in config.topics}
+    destination.write_text(yaml.safe_dump(payload, sort_keys=True), encoding='utf-8')
+    return replace(config, recording_reliability='auto', qos_path=str(destination), qos_enabled=True)
+
+
+def validate_recording_qos(config, topics):
+    if config.recording_reliability != 'reliable':
+        return
+    incompatible = [t['name'] for t in topics if t['name'] in config.topics
+                    and 'BEST_EFFORT' in t.get('qos', '')]
+    if incompatible:
+        raise ValueError('以下话题存在 Best Effort 发布端，不能强制 Reliable 录制：\n'
+                         + '\n'.join(incompatible) + '\n请选择自动适配或 Best Effort。')
 
 
 def make_report(output: Path, code: int, stopped: bool, warnings: list[str], *, forced=False) -> dict:
@@ -112,11 +138,12 @@ class RecordingSession:
             break
         effective = replace(self.config)
         for field in ("qos_path", "storage_config"):
-            raw = getattr(effective, field)
+            raw = getattr(effective, field) if getattr(effective, "qos_enabled" if field == "qos_path" else "storage_config_enabled") else ""
             if raw:
                 destination = self.session_dir / f"{field}.yaml"
                 shutil.copyfile(Path(raw).expanduser().resolve(), destination)
                 setattr(effective, field, str(destination))
+        effective = prepare_recording_qos(effective, self.session_dir)
         argv = self.capabilities.command(effective, self.output)
         # Save source interface definitions for future decoding on another machine.
         if self.config.workspace:

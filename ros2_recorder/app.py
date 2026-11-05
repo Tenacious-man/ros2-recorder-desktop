@@ -17,7 +17,7 @@ import uuid
 from PyQt5.QtCore import Qt, QTimer, QUrl, QSize
 from PyQt5.QtGui import QColor, QDesktopServices, QFont, QPalette, QIcon
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
@@ -29,7 +29,8 @@ from .environment import (
     build_command, discover_topics, inspect_workspace, load_environment, validate_message_types, installed_environments,
 )
 from .processes import ProcessRunner
-from .recording import RecordingSession, benchmark_directory, list_sessions
+from .recording import RecordingSession, benchmark_directory, list_sessions, prepare_recording_qos, validate_recording_qos
+from .yaml_templates import ensure_templates
 from .frequency import FrequencyMonitor
 from .compatibility import detect_capabilities
 from .tasks import Signals, Task
@@ -394,7 +395,7 @@ class MainWindow(QMainWindow):
         self.clear_visible_button = button('取消当前结果', lambda: self.select_visible_topics(False))
         self.select_visible_button.setProperty('compact', True)
         self.clear_visible_button.setProperty('compact', True)
-        self.topic_table = table(["录制", "话题名称", "消息类型", "发布端", "接收频率", "检测"])
+        self.topic_table = table(["录制", "话题名称", "消息类型", "发布端", "发布可靠性", "接收频率", "检测"])
         self.topic_table.setObjectName("topicTable")
         self.topic_table.setItemDelegate(TopicItemDelegate(self.topic_table))
         self.topic_table.setStyleSheet('QTableWidget::indicator { width: 20px; height: 20px; }')
@@ -402,7 +403,8 @@ class MainWindow(QMainWindow):
         self.topic_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.topic_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.topic_table.horizontalHeader().setStretchLastSection(False)
-        self.topic_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.topic_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.topic_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.topic_table.setWordWrap(False)
         self.topic_table.setTextElideMode(Qt.ElideMiddle)
         self.topic_table.verticalHeader().setDefaultSectionSize(36)
@@ -445,6 +447,12 @@ class MainWindow(QMainWindow):
         self.storage.addItems(["sqlite3", "mcap"])
         self.storage.currentTextChanged.connect(self._storage_changed)
         settings.addRow("存储格式", self.storage)
+        self.recording_reliability = QComboBox()
+        self.recording_reliability.addItem("自动适配（推荐）", "auto")
+        self.recording_reliability.addItem("Reliable（可靠传输）", "reliable")
+        self.recording_reliability.addItem("Best Effort（尽力传输）", "best_effort")
+        self.recording_reliability.setToolTip("自动适配按各话题发布端选择可靠性；高级 QoS YAML 可覆盖自动适配。强制 Reliable 无法接收 Best Effort 发布端。可靠传输不代表录包绝不漏帧。")
+        settings.addRow("录制可靠性", self.recording_reliability)
         self.preset = QComboBox()
         settings.addRow("存储预设", self.preset)
         self.preset.currentTextChanged.connect(self._preset_hint)
@@ -482,10 +490,13 @@ class MainWindow(QMainWindow):
         self.compression_threads = spin(0, 1024)
         self.compression_threads.setSpecialValueText("自动")
         advanced_form.addRow("压缩线程", self.compression_threads)
-        self.qos_path = QLineEdit()
-        advanced_form.addRow("QoS YAML", path_row(self.qos_path, lambda: self.choose_yaml(self.qos_path)))
-        self.storage_config = QLineEdit()
-        advanced_form.addRow("存储 YAML", path_row(self.storage_config, lambda: self.choose_yaml(self.storage_config)))
+        self.yaml_templates = ensure_templates()
+        self.qos_path = QLineEdit(str(self.yaml_templates['qos']))
+        self.qos_enabled = QCheckBox("启用")
+        advanced_form.addRow("QoS YAML", self._yaml_controls(self.qos_path, self.qos_enabled, 'qos'))
+        self.storage_config = QLineEdit(str(self.yaml_templates[self.storage.currentText()]))
+        self.storage_config_enabled = QCheckBox("启用")
+        advanced_form.addRow("存储 YAML", self._yaml_controls(self.storage_config, self.storage_config_enabled, 'storage'))
         self.include_hidden = QCheckBox("包含隐藏话题")
         self.use_sim_time = QCheckBox("使用仿真时间（需要 /clock）")
         advanced_form.addRow(self.include_hidden)
@@ -748,6 +759,10 @@ class MainWindow(QMainWindow):
             return
         self.preset.clear()
         self.preset.addItems(["默认", "resilient"] if self.storage.currentText() == "sqlite3" else ["默认", "fastwrite", "zstd_fast", "zstd_small"])
+        if hasattr(self, 'storage_config'):
+            defaults = {str(p) for k, p in self.yaml_templates.items() if k != 'qos'}
+            if self.storage_config.text() in defaults:
+                self.storage_config.setText(str(self.yaml_templates[self.storage.currentText()]))
         self._apply_capabilities()
 
     def _apply_capabilities(self):
@@ -773,6 +788,8 @@ class MainWindow(QMainWindow):
                                (self.compression_threads, '--compression-threads')):
             supported(widget, option)
         supported(self.compression_queue, '--compression-queue-size', neutral=4)
+        for i in range(1, self.recording_reliability.count()):
+            self.recording_reliability.model().item(i).setEnabled('--qos-profile-overrides-path' in caps.options)
         for i in range(self.preset.count()):
             self.preset.model().item(i).setEnabled(i == 0 or '--storage-preset-profile' in caps.options)
         self.preset.setToolTip('' if '--storage-preset-profile' in caps.options else '当前录制器仅支持默认存储配置')
@@ -806,6 +823,10 @@ class MainWindow(QMainWindow):
         self.preset_note.setText(hints.get(self.preset.currentText(), "缓存只缓解短时堵塞；磁盘持续写速仍需跟上数据量。"))
 
     def get_config(self):
+        for enabled, target, label in ((self.qos_enabled, self.qos_path, 'QoS'),
+                                       (self.storage_config_enabled, self.storage_config, '存储')):
+            if enabled.isChecked() and not target.text().strip():
+                raise ValueError(f"请为已启用的 {label} YAML 选择文件")
         config = RecordConfig(
             output_root=self.output_root.text().strip(), prefix=self.prefix.text().strip(),
             all_topics=False, topics=sorted(self.selected_topics),
@@ -815,8 +836,9 @@ class MainWindow(QMainWindow):
             cache_bytes=int(self.cache_bytes.text().strip()) if self.cache_bytes.text().strip() else -1,
             split_bytes=int(self.split_bytes.text().strip()) if self.split_bytes.text().strip() else -1,
             compression=self.compression.currentText(), compression_queue=self.compression_queue.value(),
-            compression_threads=self.compression_threads.value(), qos_path=self.qos_path.text().strip(),
-            storage_config=self.storage_config.text().strip(), include_hidden=self.include_hidden.isChecked(),
+            recording_reliability=self.recording_reliability.currentData(),
+            compression_threads=self.compression_threads.value(), qos_path=self.qos_path.text().strip(), qos_enabled=self.qos_enabled.isChecked(),
+            storage_config=self.storage_config.text().strip(), storage_config_enabled=self.storage_config_enabled.isChecked(), include_hidden=self.include_hidden.isChecked(),
             use_sim_time=self.use_sim_time.isChecked(), min_free_gib=self.min_free.value(),
             auto_stop_low_disk=self.auto_stop_disk.isChecked(), workspace=self.active_workspace,
             packages=list(self.active_packages), environment_setup=self.loaded_setup,
@@ -842,13 +864,18 @@ class MainWindow(QMainWindow):
         self.split_size.setValue(config.split_mib)
         self.cache_bytes.setText(str(config.cache_bytes) if config.cache_bytes >= 0 else "")
         self.split_bytes.setText(str(config.split_bytes) if config.split_bytes >= 0 else "")
-        self.advanced_toggle.setChecked(config.cache_bytes >= 0 or config.split_bytes >= 0)
+        self.advanced_toggle.setChecked(config.cache_bytes >= 0 or config.split_bytes >= 0
+                                        or bool(config.qos_path and config.qos_enabled)
+                                        or bool(config.storage_config and config.storage_config_enabled))
         self.split_seconds.setValue(config.split_seconds)
         self.compression.setCurrentText(config.compression)
         self.compression_queue.setValue(config.compression_queue)
         self.compression_threads.setValue(config.compression_threads)
-        self.qos_path.setText(config.qos_path)
-        self.storage_config.setText(config.storage_config)
+        self.recording_reliability.setCurrentIndex(self.recording_reliability.findData(config.recording_reliability))
+        self.qos_path.setText(config.qos_path or str(self.yaml_templates['qos']))
+        self.qos_enabled.setChecked(bool(config.qos_path and config.qos_enabled))
+        self.storage_config.setText(config.storage_config or str(self.yaml_templates[config.storage]))
+        self.storage_config_enabled.setChecked(bool(config.storage_config and config.storage_config_enabled))
         self.include_hidden.setChecked(config.include_hidden)
         self.use_sim_time.setChecked(config.use_sim_time)
         self.min_free.setValue(config.min_free_gib)
@@ -1053,10 +1080,19 @@ class MainWindow(QMainWindow):
             pubs = QTableWidgetItem(str(topic['publishers']))
             pubs.setToolTip(topic.get('qos', ''))
             self.topic_table.setItem(row, 3, pubs)
+            raw_qos = topic.get("qos", "")
+            policies = {v.strip() for v in raw_qos.split(",") if v.strip()}
+            reliability = ("混合" if {"RELIABLE", "BEST_EFFORT"} <= policies else
+                           "Reliable" if policies == {"RELIABLE"} else
+                           "Best Effort" if policies == {"BEST_EFFORT"} else
+                           "未知" if topic["publishers"] else "无发布端")
+            qos_item = QTableWidgetItem(reliability)
+            qos_item.setToolTip("发布端 QoS 可靠性（不是 TCP/UDP）：" + (raw_qos or "尚未发现可靠性") + "；接收频率按发布端自动适配订阅。")
+            self.topic_table.setItem(row, 4, qos_item)
             value = self._frequency_text(name)
             hz_item = QTableWidgetItem(value)
             hz_item.setToolTip(self._frequency_tooltip(name))
-            self.topic_table.setItem(row, 4, hz_item)
+            self.topic_table.setItem(row, 5, hz_item)
             reason = ""
             if self.frequency_suspended:
                 state, reason = "已暂停", "录制或时间戳监听期间暂停频率检测，结束后恢复。"
@@ -1073,7 +1109,7 @@ class MainWindow(QMainWindow):
             toggle = button(state, lambda checked=False, n=name: self.toggle_frequency(n))
             toggle.setEnabled(not reason)
             toggle.setToolTip(reason or ("关闭此话题的频率检测" if name in self.monitors else "检测此话题的接收频率"))
-            self.topic_table.setCellWidget(row, 5, toggle)
+            self.topic_table.setCellWidget(row, 6, toggle)
             self.topic_table.setRowHeight(row, 36)
         self.topic_table.blockSignals(False)
         self._filter_topic_rows()
@@ -1244,7 +1280,7 @@ class MainWindow(QMainWindow):
             return
         for row, topic in enumerate(self.display_topics):
             if topic['name'] == name:
-                item = self.topic_table.item(row, 4)
+                item = self.topic_table.item(row, 5)
                 item.setText(self._frequency_text(name))
                 item.setToolTip(self._frequency_tooltip(name))
 
@@ -1272,11 +1308,12 @@ class MainWindow(QMainWindow):
         if not any(t['name'] == name for t in self.topics):
             return "当前环境尚未发现该话题，发现后会按自动检测开关启动检测。"
         result = self.frequency_results.get(name, {})
+        policy = result.get('subscription_reliability', '自动适配')
         if 'error' in result:
             return result['error']
         if result.get('min_ms') is None:
-            return "最近 5 秒、最多 2000 个样本；本机接收频率，非发送端计数或 bag 写入频率。"
-        return f"样本：{result['samples']}\n帧间隔：{result['min_ms']:.2f}～{result['max_ms']:.2f} ms\n间隔标准差：{result['jitter_ms']:.2f} ms\n最近 5 秒接收窗口；低频话题可能显示无新消息。"
+            return f"测频订阅可靠性：{policy}\n最近 5 秒、最多 2000 个样本；本机接收频率，非发送端计数或 bag 写入频率。"
+        return f"测频订阅可靠性：{policy}\n样本：{result['samples']}\n帧间隔：{result['min_ms']:.2f}～{result['max_ms']:.2f} ms\n间隔标准差：{result['jitter_ms']:.2f} ms\n最近 5 秒接收窗口；低频话题可能显示无新消息。"
 
     def _monitor_done(self, name, code):
         monitor = self.frequency_monitor
@@ -1301,6 +1338,59 @@ class MainWindow(QMainWindow):
         if path:
             self.output_root.setText(path)
             self.history_root.setText(path)
+
+    def _yaml_controls(self, target, enabled, kind):
+        row = QWidget()
+        layout = QVBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(target)
+        actions = QHBoxLayout()
+        actions.addWidget(enabled)
+        actions.addWidget(button("浏览…", lambda: self.choose_yaml(target)))
+        actions.addWidget(button("编辑", lambda: self.edit_yaml(target)))
+        actions.addWidget(button("默认文件", lambda: target.setText(str(self.yaml_templates[
+            self.storage.currentText() if kind == 'storage' else 'qos']))))
+        layout.addLayout(actions)
+        target.setToolTip("未勾选启用时，不读取、不验证，也不向录制器传入此文件。默认文件不会覆盖你已保存的修改。")
+        return row
+
+    def edit_yaml(self, target):
+        import yaml
+        try:
+            path = Path(target.text().strip()).expanduser()
+            if not path.is_file() or path.stat().st_size > 2 * MIB:
+                raise ValueError("配置文件不存在或超过 2 MiB；请先选择默认文件或浏览文件。")
+            dialog = QDialog(self)
+            dialog.setWindowTitle("编辑 YAML 配置")
+            dialog.resize(760, 560)
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(text_label(str(path)))
+            editor = QPlainTextEdit(path.read_text(encoding='utf-8'))
+            layout.addWidget(editor)
+            layout.addWidget(text_label("保存不会自动启用；请在录制配置中勾选“启用”。存储 YAML 的格式必须与当前存储格式匹配。", True))
+            actions = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+            layout.addWidget(actions)
+            def save():
+                try:
+                    content = editor.toPlainText()
+                    if len(content.encode('utf-8')) > 2 * MIB or not isinstance(yaml.safe_load(content), dict):
+                        raise ValueError("配置必须是 YAML 对象，且不超过 2 MiB")
+                    import tempfile
+                    with tempfile.NamedTemporaryFile('w', dir=path.parent, encoding='utf-8', delete=False) as stream:
+                        temporary = Path(stream.name)
+                        stream.write(content)
+                    try:
+                        temporary.replace(path)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    dialog.accept()
+                except Exception as exc:
+                    QMessageBox.warning(dialog, "无法保存", str(exc))
+            actions.accepted.connect(save)
+            actions.rejected.connect(dialog.reject)
+            dialog.exec_()
+        except Exception as exc:
+            self._error(str(exc))
 
     def choose_yaml(self, target):
         path, _ = QFileDialog.getOpenFileName(self, "选择配置文件", "", "YAML (*.yaml *.yml);;所有文件 (*)")
@@ -1444,8 +1534,11 @@ class MainWindow(QMainWindow):
                     raise ValueError("频率检测进程尚未退出，已取消启动录制")
             import subprocess
             caps = detect_capabilities(env)
-            caps.command(config, Path(config.output_root) / 'capability_check')
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix='recorder-qos-check-') as directory:
+                caps.command(prepare_recording_qos(config, directory), Path(config.output_root) / 'capability_check')
             topics = discover_topics(env, config.include_hidden)
+            validate_recording_qos(config, topics)
             def wanted(t):
                 return t['name'] in config.topics
             missing = [t['name'] for t in topics if wanted(t) and (not t['available'] or len(t['types']) != 1)]
@@ -1630,6 +1723,10 @@ class MainWindow(QMainWindow):
         try:
             config = self.get_config()
             destination = Path(config.output_root).expanduser() / (config.prefix + "_自动时间戳")
+            preview_dir = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "ros2-recorder" / "qos-preview"
+            import hashlib
+            preview_key = hashlib.sha256(json.dumps(config.to_dict(), sort_keys=True).encode()).hexdigest()[:16]
+            config = prepare_recording_qos(config, preview_dir / preview_key)
             command = shlex.join(self.capabilities.command(config, destination) if self.capabilities else config.argv(destination))
             dialog = QMessageBox(self)
             dialog.setWindowTitle("录制命令预览")

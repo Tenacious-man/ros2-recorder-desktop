@@ -69,16 +69,21 @@ def isolated_env(domain):
     return env
 
 
-def roundtrip(tmp_path, env, storage, message_type='std_msgs/msg/String', setup='', workspace=''):
+def roundtrip(tmp_path, env, storage, message_type='std_msgs/msg/String', setup='', workspace='', reliability='auto', use_yaml=False):
     publisher_file = tmp_path / 'publisher.py'
     publisher_file.write_text(PUBLISHER)
     topic = f'/recorder_acceptance_{storage}'
     count = 220 if message_type == 'std_msgs/msg/String' else 100
     report = []
     complete = threading.Event()
+    from ros2_recorder.yaml_templates import ensure_templates
+    templates = ensure_templates() if use_yaml else {}
     session = RecordingSession(
-        RecordConfig(output_root=str(tmp_path / 'bags'), all_topics=False, topics=[topic],
+        RecordConfig(qos_path=str(templates['qos']) if use_yaml else '',
+                     storage_config=str(templates[storage]) if use_yaml else '',
+                     output_root=str(tmp_path / 'bags'), all_topics=False, topics=[topic],
                      storage=storage, cache_mib=8, split_mib=1, min_free_gib=0,
+                     recording_reliability=reliability,
                      environment_setup=setup, workspace=workspace), env,
         on_done=lambda value: (report.append(value), complete.set()),
     )
@@ -171,3 +176,16 @@ ament_package()
         if build.returncode is None:
             build.stop(force=True)
             build.wait(5)
+
+
+@pytest.mark.integration
+def test_forced_reliable_recording_roundtrip(tmp_path):
+    roundtrip(tmp_path, isolated_env(174), 'sqlite3', reliability='reliable')
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize('storage', ['sqlite3', 'mcap'])
+def test_default_yaml_templates_real_recording(tmp_path, monkeypatch, storage):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
+    roundtrip(tmp_path, isolated_env(171 if storage == 'sqlite3' else 172),
+              storage, use_yaml=True)

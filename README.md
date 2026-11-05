@@ -4,7 +4,7 @@
 
 ## 启动
 
-使用 deb 安装包时，在包所在目录运行 `sudo apt install ./ros2-recorder-desktop_0.4.0-1_all.deb`，然后在应用菜单搜索“ROS 2 录制工作台”，或运行 `ros2-recorder`。需要补齐 ROS 组件时运行 `ros2-recorder-setup`，没有 ROS 2 则运行 `ros2-recorder-setup --install-ros`。deb 不包含 ROS 2 本体、设备驱动或自定义消息源码。完整迁移步骤见 [安装说明](INSTALL.md)，本次改动见 [v0.4.0 发布说明](docs/release-notes.md)。
+使用 deb 安装包时，在包所在目录运行 `sudo apt install ./ros2-recorder-desktop_0.5.0-1_all.deb`，然后在应用菜单搜索“ROS 2 录制工作台”，或运行 `ros2-recorder`。需要补齐 ROS 组件时运行 `ros2-recorder-setup`，没有 ROS 2 则运行 `ros2-recorder-setup --install-ros`。deb 不包含 ROS 2 本体、设备驱动或自定义消息源码。完整迁移步骤见 [安装说明](INSTALL.md)，本次改动见 [v0.5.0 发布说明](docs/release-notes.md)。
 
 首次安装或补齐依赖，在软件目录运行：
 
@@ -173,3 +173,19 @@ QT_QPA_PLATFORM=offscreen python3 -m pytest -q
 参考：[rosbag2](https://github.com/ros2/rosbag2)、[早期录制参数](https://github.com/ros2/rosbag2/blob/foxy/ros2bag/ros2bag/verb/record.py)、[较新录制参数](https://github.com/ros2/rosbag2/blob/jazzy/ros2bag/ros2bag/verb/record.py)。
 
 实时表格测试另覆盖基准切换、正负毫秒差值、最新消息时间倒退、零时间戳、陈旧订阅快照拒绝、暂停原频率检测，以及真实混合消息类型订阅与进程退出清理。
+
+
+### 话题可靠性与录制 QoS
+
+话题表的“发布可靠性”列显示 Reliable、Best Effort、混合、未知或无发布端；这是 ROS 2 QoS 可靠性，不是 TCP/UDP 类型。测频订阅会跟踪发布端变化：所有已发现发布端均为 Reliable 时采用 Reliable，否则采用 Best Effort。鼠标悬停接收频率可查看实际测频订阅可靠性。
+
+“录制可靠性”默认为自动适配，由 rosbag2 按各话题发布端选择；也可对勾选的话题统一指定 Reliable 或 Best Effort。强制 Reliable 前会检查已发现的 Best Effort 发布端并阻止不兼容的录制。之后新出现或更改的发布端仍需核对录制日志。指定模式会生成本次会话的 recording_qos.yaml 并保存在 .recorder_sessions 中，配置方案保留该选择。高级自定义 QoS YAML 与指定模式不能同时使用；使用自定义 YAML 时请选自动适配，此时 YAML 中指定的策略优先。Reliable 不能保证驱动、应用和磁盘整条链路不漏帧，仍需核对录包计数与采集时间戳。
+
+
+### 可选 YAML 模板
+
+高级参数中的 QoS YAML 和存储 YAML 分别有“启用”勾选框、浏览、编辑和默认文件入口。未勾选时保留路径但不读取、验证或传入录制器；保存编辑也不会自动启用。首次启动会在 `~/.config/ros2-recorder/templates/`（遵循 XDG_CONFIG_HOME）创建 `qos.yaml`、`sqlite3.yaml` 和 `mcap.yaml`，已有文件不会被覆盖。“默认文件”只选择默认路径，不重置已编辑内容。切换存储格式时仅自动切换默认存储文件，自选文件保留。旧配置和导入命令中明确指定的 YAML 仍按启用状态加载。
+
+QoS YAML 按完整话题名配置 reliability、history、depth、durability。默认模板为 `{}`，保持自动适配，注释内提供 `/iv_points` 示例（使用时删除 `{}` 并取消示例注释）。sqlite3 使用 `write.pragmas` 列表，默认空列表沿用插件/预设参数。MCAP 使用 `chunkSize`、`compression` 等大小写敏感字段，默认模板保留索引和块校验、不压缩。存储 YAML 的显式参数会覆盖相应存储预设，请使用与 sqlite3/MCAP 对应的文件。启用的文件在每次录制时保存独立快照。
+
+格式参考：[ROS 2 QoS 配置](https://github.com/ros2/rosbag2#overriding-qos-profiles)、[sqlite3 存储配置](https://github.com/ros2/rosbag2/tree/rolling/rosbag2_storage_sqlite3)、[MCAP 存储配置](https://github.com/ros-tooling/rosbag2_storage_mcap#writer-configuration)。

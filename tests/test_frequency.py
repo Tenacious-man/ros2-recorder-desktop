@@ -22,9 +22,11 @@ import sys,time
 from pathlib import Path
 import rclpy
 from std_msgs.msg import String
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 rclpy.init()
 n=rclpy.create_node('shared_frequency_test_publisher')
-pubs=[n.create_publisher(String,'/shared_hz_'+str(i),100) for i in range(12)]
+pubs=[n.create_publisher(String,'/shared_hz_'+str(i),QoSProfile(depth=100, reliability=
+    ReliabilityPolicy.RELIABLE if i % 2 == 0 else ReliabilityPolicy.BEST_EFFORT)) for i in range(12)]
 deadline=time.monotonic()+25
 while not Path(sys.argv[1]).exists() and time.monotonic()<deadline:
     for p in pubs:
@@ -41,16 +43,28 @@ rclpy.shutdown()
     monitor.start()
     try:
         deadline = time.monotonic() + 15
-        while not all(results.get(name, {}).get('hz') for name in names) and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            if all(results.get(name, {}).get('hz') and
+                   results[name].get('subscription_reliability') ==
+                   ('RELIABLE' if i % 2 == 0 else 'BEST_EFFORT')
+                   for i, name in enumerate(names)):
+                break
             time.sleep(.05)
         assert all(15 < results.get(name, {}).get('hz', 0) < 35 for name in names), results
+        assert all(results[name]["subscription_reliability"] ==
+                   ("RELIABLE" if i % 2 == 0 else "BEST_EFFORT") for i, name in enumerate(names))
         pid = monitor.runner.pid
         monitor.update(dict.fromkeys(names[:4], 'std_msgs/msg/String'))
         time.sleep(.4)
         monitor.update(dict.fromkeys(names, 'std_msgs/msg/String'))
         results.clear()
         deadline = time.monotonic() + 10
-        while not all(results.get(name, {}).get('hz') for name in names) and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            if all(results.get(name, {}).get('hz') and
+                   results[name].get('subscription_reliability') ==
+                   ('RELIABLE' if i % 2 == 0 else 'BEST_EFFORT')
+                   for i, name in enumerate(names)):
+                break
             time.sleep(.05)
         assert all(results.get(name, {}).get('hz') for name in names)
         assert monitor.runner.pid == pid, 'updating topics restarted the shared process'

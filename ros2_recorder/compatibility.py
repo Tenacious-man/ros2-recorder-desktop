@@ -29,6 +29,8 @@ class RecorderCapabilities:
 
     def command(self, config, output):
         config.validate()
+        if config.recording_reliability != "auto":
+            raise ValueError("请先生成录制 QoS 配置文件")
         if self.storage_ids and config.storage not in self.storage_ids:
             raise ValueError(f"当前 ROS 2 未安装 {config.storage} 存储插件，请选择可用格式或安装对应插件")
         args = ['ros2', 'bag', 'record', '--output', str(output), '--storage', config.storage]
@@ -60,7 +62,7 @@ class RecorderCapabilities:
                 args.append('--topics')
             args.extend(config.topics)
         for flag, value in (('--exclude', config.exclude), ('--storage-preset-profile', config.preset),
-                            ('--qos-profile-overrides-path', config.qos_path), ('--storage-config-file', config.storage_config)):
+                            ('--qos-profile-overrides-path', config.qos_path if config.qos_enabled else ''), ('--storage-config-file', config.storage_config if config.storage_config_enabled else '')):
             if value:
                 add(flag, value)
         if config.compression != 'none':

@@ -26,12 +26,15 @@ def test_native_workbench_profile_roundtrip_and_monitor_render(tmp_path, monkeyp
     assert not errors
     original = import_command('ros2 bag record /radar --max-cache-size 1000000000 -b 3000000000')
     window.apply_config(original, load_env=False)
-    assert window.get_config() == original
+    restored = window.get_config()
+    assert restored == __import__("dataclasses").replace(
+        original, qos_path=window.qos_path.text(), qos_enabled=False,
+        storage_config=window.storage_config.text(), storage_config_enabled=False)
     window.cache.setValue(256)
     assert window.get_config().cache_bytes == -1
     window.topics = [{'name': '/radar', 'types': ['radar_msgs/msg/Target'], 'publishers': 1, 'available': False, 'reason': 'not loaded'}]
     window._render_topics()
-    assert not window.topic_table.cellWidget(0, 5).isEnabled()
+    assert not window.topic_table.cellWidget(0, 6).isEnabled()
     assert window.stack.count() == 5
     window.build_cancelled = True
     window._build_done(0)
@@ -193,7 +196,7 @@ def test_discovery_retries_latest_environment_when_previous_probe_is_busy(tmp_pa
         assert calls == ['base', 'overlay']
         assert [t['name'] for t in window.topics] == ['/overlay']
         assert window.monitors == {'/overlay': 'std_msgs/msg/String'}
-        assert window.topic_table.cellWidget(0, 5).text() == '关闭'
+        assert window.topic_table.cellWidget(0, 6).text() == '关闭'
     finally:
         release_old.set()
         window.close()
@@ -279,7 +282,7 @@ def test_profiles_only_select_real_topics_without_adding_offline_rows(tmp_path, 
         assert window.topic_table.rowCount() == 1
         assert window.topic_table.item(0, 1).text() == '/manual_later'
         assert window.topic_table.item(0, 2).text() == '手动添加，未发现'
-        assert not window.topic_table.cellWidget(0, 5).isEnabled()
+        assert not window.topic_table.cellWidget(0, 6).isEnabled()
         assert window.topic_count.text() == '显示 1/1 · 已勾选 1'
         assert '/manual_later' in window.get_config().topics
         assert '手动添加，未发现' in window.event_log.toPlainText()
@@ -289,7 +292,7 @@ def test_profiles_only_select_real_topics_without_adding_offline_rows(tmp_path, 
         window._render_topics()
         assert window.topic_table.rowCount() == 1
         assert window.topic_table.item(0, 2).text() == 'std_msgs/msg/String'
-        assert window.topic_table.cellWidget(0, 5).isEnabled()
+        assert window.topic_table.cellWidget(0, 6).isEnabled()
         assert window.topic_table.item(0, 0).checkState() == Qt.Checked
         assert window.topic_count.text() == '显示 1/1 · 已勾选 1'
         window.topic_table.item(0, 0).setCheckState(Qt.Unchecked)
@@ -403,4 +406,50 @@ def test_profile_load_disables_repeat_clicks_and_recovers_after_environment_task
         while window.tasks and time.monotonic() < deadline:
             app.processEvents()
             time.sleep(.01)
+        window.close()
+
+
+def test_reliability_column_and_recording_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path))
+    monkeypatch.setattr(MainWindow, '_initialize_environment', lambda *args: None)
+    window = MainWindow(auto_discover=False)
+    window.timer.stop()
+    try:
+        window.topics = [dict(name='/lidar', types=['sensor_msgs/msg/PointCloud2'],
+                              publishers=2, available=True, qos='BEST_EFFORT, RELIABLE')]
+        window.selected_topics = {'/lidar'}
+        window._render_topics()
+        assert window.topic_table.item(0, 4).text() == '混合'
+        assert window.recording_reliability.currentData() == 'auto'
+        window.recording_reliability.setCurrentIndex(window.recording_reliability.findData('reliable'))
+        config = window.get_config()
+        assert config.recording_reliability == 'reliable'
+        window.apply_config(config, load_env=False)
+        assert window.get_config().recording_reliability == 'reliable'
+    finally:
+        window.close()
+
+
+def test_yaml_default_paths_enable_and_storage_switch(tmp_path, monkeypatch):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path))
+    monkeypatch.setattr(MainWindow, '_initialize_environment', lambda *args: None)
+    window = MainWindow(auto_discover=False)
+    window.timer.stop()
+    try:
+        window.selected_topics = {'/iv_points'}
+        assert not window.qos_enabled.isChecked()
+        assert not window.storage_config_enabled.isChecked()
+        assert window.qos_path.text().endswith('/templates/qos.yaml')
+        config = window.get_config()
+        assert not config.qos_enabled and not config.storage_config_enabled
+        window.apply_config(config, load_env=False)
+        assert not window.qos_enabled.isChecked()
+        window.storage.setCurrentText('mcap')
+        assert window.storage_config.text().endswith('/templates/mcap.yaml')
+        window.storage_config.setText('/custom/storage.yaml')
+        window.storage.setCurrentText('sqlite3')
+        assert window.storage_config.text() == '/custom/storage.yaml'
+        window.qos_enabled.setChecked(True)
+        assert window.get_config().qos_enabled
+    finally:
         window.close()
