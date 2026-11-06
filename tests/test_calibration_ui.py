@@ -112,7 +112,7 @@ def test_automatic_subscription_cached_adjust_pick_and_permission_cleanup(tmp_pa
         window._lock_admin()
         pump(app, lambda: not page.busy)
         assert monitor.stopping and not window.frequency_suspended
-        assert all(window.nav.item(i).isHidden() for i in range(5, 8))
+        assert all(window.nav.item(i).isHidden() for i in window.admin_rows)
         page.reconcile_subscription()
         assert page.monitor is None
         window._unlock_admin()

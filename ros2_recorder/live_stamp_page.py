@@ -1,6 +1,7 @@
 """Select live topics and compare their last-arriving header timestamps."""
 from __future__ import annotations
 
+from dataclasses import asdict
 import time
 
 from PyQt5.QtCore import QPoint, Qt, QTimer, pyqtSignal
@@ -11,15 +12,20 @@ from PyQt5.QtWidgets import (
 )
 
 from .environment import discover_topics
+from .communication import CommunicationSettings, PROFILE_VARIABLE, RELIABILITY, TRANSPORTS
+from .communication_dialog import CommunicationComparison, CommunicationDialog
+from .config import atomic_json
 from .item_delegate import TopicItemDelegate
 from .latest_stamps import LatestStampMonitor, format_stamp, latest_difference, sample_status
+
+LOCAL_REFERENCE = 'local_receipt'
 
 
 class ReorderableTopicTable(QTableWidget):
     rowsReordered = pyqtSignal()
 
     def __init__(self, parent=None):
-        super().__init__(0, 4, parent)
+        super().__init__(0, 5, parent)
         self.setItemDelegate(TopicItemDelegate(self))
         self.dragged_topic = None
         self.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -278,6 +284,10 @@ class LiveStampPage(QWidget):
         self.selected = {}
         self.samples = {}
         self.rows = {}
+        self.communication_path = host.store.path.with_name('communication.json')
+        self.communication = CommunicationSettings.load(self.communication_path)
+        self.run_settings = {}
+        self.baseline = None
         self.monitor = None
         self.preparing = False
         self.cancelled_start = False
@@ -291,6 +301,9 @@ class LiveStampPage(QWidget):
         self.kill_timer = QTimer(self)
         self.kill_timer.setSingleShot(True)
         self.kill_timer.timeout.connect(self.force_stop)
+        self.limit_timer = QTimer(self)
+        self.limit_timer.setSingleShot(True)
+        self.limit_timer.timeout.connect(self.cancel)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         title = QLabel('实时消息时间戳')
@@ -299,6 +312,9 @@ class LiveStampPage(QWidget):
         description = QLabel('选择需要对比的话题和基准，查看最新消息的 header.stamp 和时间差。')
         description.setWordWrap(True)
         layout.addWidget(description)
+        self.local_clock = QLabel()
+        self.local_clock.setToolTip('本机当前系统时间，单位为 Unix 秒。各消息的差值使用接收时刻。')
+        layout.addWidget(self.local_clock)
         controls = QHBoxLayout()
         self.select_button = QPushButton('选择话题…')
         self.select_button.clicked.connect(self.choose_topics)
@@ -317,9 +333,25 @@ class LiveStampPage(QWidget):
         self.reference.currentIndexChanged.connect(self.render_samples)
         controls.addWidget(self.reference, 1)
         layout.addLayout(controls)
+        communication_row = QHBoxLayout()
+        self.communication_button = QPushButton('对照监听设置…')
+        self.communication_button.clicked.connect(self.choose_communication)
+        communication_row.addWidget(self.communication_button)
+        self.baseline_button = QPushButton('将本轮设为基线')
+        self.baseline_button.clicked.connect(self.save_baseline)
+        communication_row.addWidget(self.baseline_button)
+        self.comparison_button = QPushButton('查看通信对照…')
+        self.comparison_button.clicked.connect(self.show_comparison)
+        communication_row.addWidget(self.comparison_button)
+        communication_row.addStretch()
+        self.communication_label = QLabel()
+        self.communication_label.setWordWrap(True)
+        communication_row.addWidget(self.communication_label, 1)
+        layout.addLayout(communication_row)
         self.table = ReorderableTopicTable(self)
         self.table.rowsReordered.connect(self.apply_table_order)
-        self.table.setHorizontalHeaderLabels(['已选话题', '最新 header.stamp（秒）', '相对基准（ms）', '状态'])
+        self.table.setHorizontalHeaderLabels(
+            ['已选话题', '最新 header.stamp（秒）', '本机接收时间（秒）', '相对基准（ms）', '状态'])
         self.table.verticalHeader().hide()
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -328,7 +360,8 @@ class LiveStampPage(QWidget):
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
         self.result_stack = QStackedWidget()
         self.empty_hint = QLabel('尚未选择话题\n点击“选择话题”添加需要对比的传感器话题。')
         self.empty_hint.setAlignment(Qt.AlignCenter)
@@ -336,10 +369,10 @@ class LiveStampPage(QWidget):
         self.result_stack.addWidget(self.empty_hint)
         self.result_stack.addWidget(self.table)
         layout.addWidget(self.result_stack, 1)
-        formula = QLabel('差值 = 本话题最新 header.stamp − 基准最新 header.stamp。正值表示时间戳更大，负值表示更小。')
-        formula.setWordWrap(True)
-        layout.addWidget(formula)
-        note = QLabel('比较各话题最新收到的一条消息，不做帧配对。不同发布频率会让差值跳动，不能仅凭这个值判断硬件同步。')
+        self.formula = QLabel()
+        self.formula.setWordWrap(True)
+        layout.addWidget(self.formula)
+        note = QLabel('本机差值也包含消息传输和接收处理耗时。话题间比较使用各自最新的消息，发布频率不同会影响差值。')
         note.setWordWrap(True)
         note.setProperty('secondary', True)
         layout.addWidget(note)
@@ -351,6 +384,8 @@ class LiveStampPage(QWidget):
         self.timer.setInterval(100)
         self.timer.timeout.connect(self.render_samples)
         self.timer.start()
+        self.update_reference_options()
+        self.render_samples()
         self.update_controls()
 
     @property
@@ -363,8 +398,45 @@ class LiveStampPage(QWidget):
                                     not (self.monitor and self.monitor.stopping))
         self.select_button.setEnabled(not self.host.pending_close)
         self.reference.setEnabled(bool(self.selected))
+        idle = not self.busy and not self.host.pending_close
+        measured = any('seconds' in sample for sample in self.samples.values())
+        self.communication_button.setEnabled(idle)
+        self.baseline_button.setEnabled(idle and measured)
+        self.comparison_button.setEnabled(not self.host.pending_close and (measured or self.baseline is not None))
+        settings = self.communication
+        duration = f' · {settings.duration_s} 秒/轮' if settings.duration_s else ''
+        self.communication_label.setText(f'{RELIABILITY[settings.reliability]} · {TRANSPORTS[settings.transport]}{duration}')
         if self.topic_dialog:
             self.topic_dialog.update_controls()
+
+    def choose_communication(self):
+        dialog = CommunicationDialog(self, self.communication)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        settings = dialog.settings()
+        try:
+            atomic_json(self.communication_path, asdict(settings))
+        except OSError as exc:
+            self.status.setText(f'保存通信设置失败：{exc}')
+            return
+        self.communication = settings
+        self.status.setText('已保存通信设置，下一轮监听时生效。')
+        self.update_controls()
+
+    def current_run(self):
+        samples = {name: dict(sample, kind=self.selected[name]) for name, sample in self.samples.items()
+                   if name in self.selected and 'seconds' in sample}
+        return {'settings': dict(self.run_settings), 'samples': samples} if samples else None
+
+    def save_baseline(self):
+        run = self.current_run()
+        if run:
+            self.baseline = run
+            self.status.setText('已设为对照基线。修改通信设置后再监听一轮，即可查看对照。')
+            self.update_controls()
+
+    def show_comparison(self):
+        CommunicationComparison(self, self.baseline, self.current_run()).exec_()
 
     def choose_topics(self):
         if self.topic_dialog and self.topic_dialog.isVisible():
@@ -424,7 +496,7 @@ class LiveStampPage(QWidget):
             item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
             item.setToolTip(name + '\n' + ', '.join(topic['types']) + '\n' + topic.get('reason', ''))
             self.table.setItem(row, 0, item)
-            for column in (1, 2, 3):
+            for column in range(1, self.table.columnCount()):
                 self.table.setItem(row, column, QTableWidgetItem('—'))
             self.table.setRowHeight(row, 43)
         self.table.blockSignals(False)
@@ -452,10 +524,11 @@ class LiveStampPage(QWidget):
         old_reference = self.reference.currentData()
         self.reference.blockSignals(True)
         self.reference.clear()
+        self.reference.addItem('本机系统时间（接收时）', LOCAL_REFERENCE)
         for name in self.selected:
             self.reference.addItem(name, name)
         index = self.reference.findData(old_reference)
-        self.reference.setCurrentIndex(index if index >= 0 else (0 if self.selected else -1))
+        self.reference.setCurrentIndex(max(0, index))
         self.reference.blockSignals(False)
 
     def subscription_topics(self):
@@ -498,6 +571,18 @@ class LiveStampPage(QWidget):
         self.cancelled_start = False
         self.samples.clear()
         env = dict(self.host.active_env)
+        settings = self.communication
+        transport = TRANSPORTS[settings.transport]
+        if settings.transport == 'shm':
+            transport += f' · SHM {settings.shm_mib} MiB'
+        if settings.transport != 'environment' and settings.udp_kib:
+            transport += f' · UDP 请求 {settings.udp_kib} KiB'
+        if settings.transport == 'environment':
+            profile = env.get('FASTDDS_DEFAULT_PROFILES_FILE') or env.get(PROFILE_VARIABLE)
+            if profile:
+                transport += f' · {profile}'
+        self.run_settings = {'reliability': RELIABILITY[settings.reliability], 'depth': settings.depth,
+                             'transport': transport, 'domain': env.get('ROS_DOMAIN_ID', '0'), 'note': settings.note}
         previous = self.host._pause_frequency_for_recording()
         self.paused_frequency = True
         self.status.setText('正在释放频率检测订阅，准备监听…')
@@ -516,10 +601,13 @@ class LiveStampPage(QWidget):
             else:
                 try:
                     monitor = LatestStampMonitor(
-                        env, self.subscription_topics(), on_snapshot=lambda value: self._snapshot.emit(monitor, value),
+                        env, self.subscription_topics(), settings=settings,
+                        on_snapshot=lambda value: self._snapshot.emit(monitor, value),
                         on_done=lambda code: self._exited.emit(monitor, code))
                     self.monitor = monitor
                     monitor.start()
+                    if settings.duration_s:
+                        self.limit_timer.start(settings.duration_s * 1000)
                     self.status.setText(f"正在监听 {len(self.selected)} 个话题 · Domain {env.get('ROS_DOMAIN_ID', '0')}")
                 except Exception as exc:
                     self.monitor = None
@@ -541,39 +629,51 @@ class LiveStampPage(QWidget):
             if name in self.selected and sample.get('token') == monitor.tokens.get(name):
                 self.samples[name] = sample
         self.render_samples()
+        if not self.comparison_button.isEnabled() and any('seconds' in sample for sample in self.samples.values()):
+            self.comparison_button.setEnabled(not self.host.pending_close)
 
     def render_samples(self):
         reference_name = self.reference.currentData()
+        local_reference = reference_name == LOCAL_REFERENCE
         reference = self.samples.get(reference_name)
+        basis = '该条消息的本机接收时间' if local_reference else '基准话题最新 header.stamp'
+        self.formula.setText(f'差值 = 本话题最新 header.stamp − {basis}。正值表示消息时间戳更大。')
+        self.local_clock.setText(f'本机当前时间（Unix 秒）  {format_stamp(time.time_ns())}')
         running = self.monitor is not None and not self.monitor.stopping
         now = time.monotonic_ns()
         self.table.blockSignals(True)
         for name, row in self.rows.items():
             sample = self.samples.get(name)
             stamp = format_stamp(sample.get('stamp_ns')) if sample else '—'
-            delta = latest_difference(sample, reference)
+            receipt_ns = sample.get('received_wall_ns') if sample else None
+            delta = None
+            if not local_reference:
+                delta = latest_difference(sample, reference)
+            elif receipt_ns is not None and sample['status'] == 'ok':
+                delta = (sample['stamp_ns'] - receipt_ns) / 1_000_000
             difference = '—' if delta is None else ('0.000' if name == reference_name else f'{delta:+.3f}')
             state = sample_status(sample, running=running or self.preparing, now_ns=now)
             if len(self.catalog[name]['types']) != 1:
                 state = '同名话题存在多个类型'
             elif not running and not self.preparing and not sample:
                 state = '等待开始监听'
-            for column, value in ((1, stamp), (2, difference), (3, state)):
+            for column, value in ((1, stamp), (2, format_stamp(receipt_ns)), (3, difference), (4, state)):
                 self.table.item(row, column).setText(value)
                 self.table.item(row, column).setForeground(QColor('#253142'))
             if name == reference_name:
-                self.table.item(row, 2).setForeground(QColor('#176963'))
+                self.table.item(row, 3).setForeground(QColor('#176963'))
             if sample and (sample.get('status') != 'ok' or '未更新' in state):
-                self.table.item(row, 3).setForeground(QColor('#a66a2b'))
+                self.table.item(row, 4).setForeground(QColor('#a66a2b'))
             if sample:
                 detail = f"header 整数纳秒：{sample.get('stamp_ns')}\n已接收：{sample['received_count']} 条"
                 if sample.get('received_ns') is not None:
                     detail += f"\n距本机最近接收：{max(0, now - sample['received_ns']) / 1e9:.3f} 秒"
                 self.table.item(row, 1).setToolTip(detail)
-                self.table.item(row, 3).setToolTip(detail + '\n' + sample.get('error', ''))
+                self.table.item(row, 4).setToolTip(detail + '\n' + sample.get('error', ''))
         self.table.blockSignals(False)
 
     def cancel(self):
+        self.limit_timer.stop()
         if self.offline_page:
             self.offline_page.cancel()
         self.cancelled_start = True
@@ -591,6 +691,7 @@ class LiveStampPage(QWidget):
         if monitor is not self.monitor:
             return
         self.kill_timer.stop()
+        self.limit_timer.stop()
         stopped = monitor.stopping
         self.monitor = None
         self.resume_frequency()
@@ -624,6 +725,7 @@ class LiveStampPage(QWidget):
 
     def dispose(self):
         self.timer.stop()
+        self.limit_timer.stop()
         self.kill_timer.stop()
         if self.topic_dialog:
             self.topic_dialog.reject()

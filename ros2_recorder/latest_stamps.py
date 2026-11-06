@@ -7,13 +7,15 @@ import tempfile
 import time
 
 from .config import atomic_json
+from .communication import CommunicationSettings
 from .environment import probe_argv
 from .processes import ProcessRunner
 
 
 class LatestStampMonitor:
     """Reuse the recorder's independent ROS helper/process lifecycle."""
-    def __init__(self, env, topics, *, on_snapshot, on_done):
+    def __init__(self, env, topics, *, on_snapshot, on_done, settings=None):
+        self.settings = settings or CommunicationSettings()
         self.directory = tempfile.TemporaryDirectory(prefix='ros-latest-stamps-')
         self.control = Path(self.directory.name) / 'topics.json'
         self.topics = {}
@@ -21,7 +23,12 @@ class LatestStampMonitor:
         self.token_counter = 0
         self.generation = 0
         self.stopping = False
-        self.update(topics)
+        try:
+            env = self.settings.monitor_environment(env, self.directory.name)
+            self.update(topics)
+        except Exception:
+            self.directory.cleanup()
+            raise
 
         def line(raw):
             if raw.startswith('@@RESULT@@'):
@@ -54,6 +61,7 @@ class LatestStampMonitor:
         self.tokens = tokens
         self.generation += 1
         atomic_json(self.control, {'generation': self.generation,
+                                  'reliability': self.settings.reliability, 'depth': self.settings.depth,
                                   'topics': {name: {'type': kind, 'token': tokens[name]} for name, kind in topics.items()}})
 
     def start(self):

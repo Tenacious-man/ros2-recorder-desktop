@@ -167,14 +167,18 @@ def probe_argv(*args: str, env=None) -> list[str]:
     return [python_executable(env), str(Path(__file__).with_name("probe.py")), *args]
 
 
-def discover_topics(env: dict, include_hidden=False) -> list[dict]:
-    result = subprocess.run(probe_argv("topics", *( ["--hidden"] if include_hidden else []), env=env),
+def graph_probe(env, *args):
+    result = subprocess.run(probe_argv(*args, env=env),
                             env=env, capture_output=True, text=True, timeout=15)
     events = [json.loads(line[10:]) for line in result.stdout.splitlines() if line.startswith("@@RESULT@@")]
     if result.returncode or not events or "error" in events[-1]:
         detail = events[-1].get("error", "") if events else result.stderr[-2000:]
         raise RuntimeError("发现话题失败：" + detail)
-    return events[-1]["topics"]
+    return events[-1]
+
+
+def discover_topics(env: dict, include_hidden=False) -> list[dict]:
+    return graph_probe(env, "topics", *(["--hidden"] if include_hidden else []))["topics"]
 
 
 def environment_summary(env: dict, setup: str) -> dict:

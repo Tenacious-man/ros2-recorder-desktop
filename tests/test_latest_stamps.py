@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ros2_recorder.communication import CommunicationSettings, PROFILE_VARIABLE
 from ros2_recorder.environment import load_environment
 from ros2_recorder.latest_stamps import LatestStampMonitor, format_stamp, latest_difference, sample_status
 from ros2_recorder.stamp_probe import LatestStampState
@@ -47,7 +48,9 @@ def test_precision_sign_stale_and_no_header_are_explicit():
 
 
 def test_control_tokens_do_not_reuse_removed_topics(tmp_path):
-    monitor = LatestStampMonitor({}, {'/a': 'sensor_msgs/msg/Imu'}, on_snapshot=lambda _: None, on_done=lambda _: None)
+    settings = CommunicationSettings(reliability='reliable', depth=2, transport='shm', udp_kib=256)
+    monitor = LatestStampMonitor({}, {'/a': 'sensor_msgs/msg/Imu'}, on_snapshot=lambda _: None,
+                                 on_done=lambda _: None, settings=settings)
     try:
         token = monitor.tokens['/a']
         monitor.update({})
@@ -55,9 +58,30 @@ def test_control_tokens_do_not_reuse_removed_topics(tmp_path):
         assert monitor.tokens['/a'] != token
         request = json.loads(monitor.control.read_text())
         assert request['generation'] == monitor.generation
+        assert (request['reliability'], request['depth']) == ('reliable', 2)
         assert request['topics']['/a']['token'] == monitor.tokens['/a']
+        profile = Path(monitor.runner.env[PROFILE_VARIABLE]).read_text()
+        assert '<segment_size>8388608</segment_size>' in profile
+        assert '<receiveBufferSize>262144</receiveBufferSize>' in profile
+        with pytest.raises(ValueError, match='仅本机'):
+            settings.monitor_environment({'ROS_LOCALHOST_ONLY': '1'}, tmp_path)
     finally:
         monitor.directory.cleanup()
+
+
+def test_live_statistics_count_gaps_and_only_valid_frame_ages(monkeypatch):
+    monkeypatch.setattr('ros2_recorder.stamp_probe.time.time_ns', lambda: 1_000_000_000)
+    state = LatestStampState(1)
+    now = state.started_ns
+    reader = SimpleNamespace(read=lambda stamp: SimpleNamespace(sec=0, nanosec=stamp))
+    state.receive(980_000_000, reader, now_ns=now + 100_000_000)
+    state.receive(950_000_000, reader, now_ns=now + 200_000_000)
+    state.receive(0, reader, now_ns=now + 500_000_000)
+    snapshot = state.snapshot(now + 900_000_000)
+    assert snapshot['received_count'] == 3 and snapshot['hz'] == 2.5
+    assert snapshot['seconds'] == .9 and snapshot['max_gap_ms'] == 400
+    assert snapshot['age_count'] == 2
+    assert snapshot['age_p99_ms'] == snapshot['age_max_ms'] == 50
 
 
 def test_native_header_prefix_matches_ros_decoder_and_checks_schema(tmp_path):
@@ -133,6 +157,7 @@ n.destroy_node();rclpy.shutdown()
               '/stamp_lidar': 'sensor_msgs/msg/Imu', '/stamp_no_header': 'std_msgs/msg/String',
               '/stamp_missing': 'no_such_test_package/msg/Unknown'}
     monitor = LatestStampMonitor(env, topics, on_snapshot=snapshots.append, on_done=lambda _: done.set())
+    started_wall_ns = time.time_ns()
     monitor.start()
     def wait_for(predicate):
         deadline = time.monotonic() + 12
@@ -144,6 +169,9 @@ n.destroy_node();rclpy.shutdown()
         raise AssertionError(str(snapshots[-2:]))
     try:
         samples = wait_for(lambda s: all(s.get(name, {}).get('received_count', 0) for name in list(topics)[:4]))
+        now_wall_ns = time.time_ns()
+        assert all(started_wall_ns <= samples[name]['received_wall_ns'] <= now_wall_ns for name in list(topics)[:4])
+        assert samples['/stamp_missing']['received_wall_ns'] is None
         assert latest_difference(samples['/stamp_radar'], samples['/stamp_camera']) == 7.25
         assert latest_difference(samples['/stamp_lidar'], samples['/stamp_camera']) == 3.5
         assert samples['/stamp_no_header']['status'] == 'no_header'

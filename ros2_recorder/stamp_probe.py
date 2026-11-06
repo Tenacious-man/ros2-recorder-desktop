@@ -1,6 +1,7 @@
 """Latest header sampler used by probe.py; no payload history or matching."""
 from __future__ import annotations
 
+from collections import deque
 import json
 import time
 
@@ -13,15 +14,28 @@ except ImportError:
 class LatestStampState:
     def __init__(self, token, *, error=''):
         self.token = token
+        self.started_ns = time.monotonic_ns()
+        self.first_ns = None
+        self.max_gap_ns = 0
+        self.ages_ns = deque(maxlen=2048)
+        self.max_age_ns = None
+        self.age_count = 0
         self.received_count = 0
         self.received_ns = None
+        self.received_wall_ns = None
         self.stamp_ns = None
         self.status = 'no_header' if error else 'waiting'
         self.error = error
 
     def receive(self, payload, reader, *, now_ns=None):
+        self.received_wall_ns = time.time_ns()
+        arrival = time.monotonic_ns() if now_ns is None else now_ns
+        if self.received_ns is None:
+            self.first_ns = arrival
+        else:
+            self.max_gap_ns = max(self.max_gap_ns, arrival - self.received_ns)
+        self.received_ns = arrival
         self.received_count += 1
-        self.received_ns = time.monotonic_ns() if now_ns is None else now_ns
         # Invalid newest messages replace the old value too. Never display an
         # earlier good timestamp as if it belonged to the latest arrival.
         self.stamp_ns = None
@@ -38,12 +52,26 @@ class LatestStampState:
                 self.status, self.error = 'invalid', '最新消息的 header.stamp 为零，暂不比较'
             else:
                 self.status, self.error = 'ok', ''
+                age = self.received_wall_ns - self.stamp_ns
+                self.ages_ns.append(age)
+                self.age_count += 1
+                self.max_age_ns = age if self.max_age_ns is None else max(self.max_age_ns, age)
         except Exception as exc:
             self.status, self.error = 'decode_error', '最新消息时间戳解码失败：' + str(exc)[:300]
 
-    def snapshot(self):
+    def snapshot(self, now_ns=None):
+        now_ns = time.monotonic_ns() if now_ns is None else now_ns
+        span = now_ns - self.first_ns if self.first_ns is not None else 0
+        ages = sorted(self.ages_ns)
+        p99 = ages[(99 * len(ages) + 99) // 100 - 1] / 1e6 if ages else None
         return {'token': self.token, 'received_count': self.received_count, 'received_ns': self.received_ns,
-                'stamp_ns': self.stamp_ns, 'status': self.status, 'error': self.error}
+                'received_wall_ns': self.received_wall_ns, 'stamp_ns': self.stamp_ns,
+                'status': self.status, 'error': self.error,
+                'seconds': max(0, now_ns - self.started_ns) / 1e9,
+                'hz': (self.received_count - 1) * 1e9 / span if self.received_count > 1 and span > 0 else None,
+                'max_gap_ms': max(self.max_gap_ns, now_ns - self.received_ns) / 1e6 if self.received_ns is not None else None,
+                'age_count': self.age_count, 'age_p99_ms': p99,
+                'age_max_ms': self.max_age_ns / 1e6 if self.max_age_ns is not None else None}
 
 
 def watch_stamps(node, executor, context, control, emit):
@@ -51,13 +79,15 @@ def watch_stamps(node, executor, context, control, emit):
     from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
     from rosidl_runtime_py.utilities import get_message
 
-    # Best effort can receive either reliable or best-effort sensor publishers.
-    # A shallow queue keeps this view about recent arrivals, rather than backlog.
-    qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=5,
-                     reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
+    settings = json.loads(control.read_text(encoding='utf-8'))
+    reliable = settings.get('reliability') == 'reliable'
+    qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=settings.get('depth', 5),
+                     reliability=ReliabilityPolicy.RELIABLE if reliable else ReliabilityPolicy.BEST_EFFORT,
+                     durability=DurabilityPolicy.VOLATILE)
     subscriptions, states, requested = {}, {}, {}
     generation = -1
-    last_control = last_report = 0.0
+    last_control = last_report = last_qos_check = 0.0
+    incompatible = set()
     while rclpy.ok(context=context):
         now = time.monotonic()
         if now - last_control >= .1:
@@ -70,6 +100,7 @@ def watch_stamps(node, executor, context, control, emit):
                         if name in subscriptions:
                             node.destroy_subscription(subscriptions.pop(name))
                         states.pop(name, None)
+                        incompatible.discard(name)
                         requested.pop(name)
                 for name, item in wanted.items():
                     if name in requested:
@@ -94,7 +125,18 @@ def watch_stamps(node, executor, context, control, emit):
         except rclpy.executors.ExternalShutdownException:
             break
         now = time.monotonic()
+        if reliable and now - last_qos_check >= 1:
+            last_qos_check = now
+            incompatible.clear()
+            for name in subscriptions:
+                offered = node.get_publishers_info_by_topic(name)
+                if offered and all(pub.qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT for pub in offered):
+                    incompatible.add(name)
         if now - last_report >= .1:
-            emit({'generation': generation, 'samples': {name: state.snapshot() for name, state in states.items()}})
+            now_ns = time.monotonic_ns()
+            samples = {name: state.snapshot(now_ns) for name, state in states.items()}
+            for name in incompatible:
+                samples[name].update(status='waiting', error='发布端仅支持 Best Effort，请切换订阅方式')
+            emit({'generation': generation, 'samples': samples})
             last_report = now
     return 0

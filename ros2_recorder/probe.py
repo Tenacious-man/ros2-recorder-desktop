@@ -90,9 +90,25 @@ def emit(value):
     print("@@RESULT@@" + json.dumps(value, ensure_ascii=False), flush=True)
 
 
+def endpoint_qos(node, topic):
+    endpoints = []
+    for direction, getter in (('发布', node.get_publishers_info_by_topic),
+                              ('订阅', node.get_subscriptions_info_by_topic)):
+        for endpoint in getter(topic):
+            qos = endpoint.qos_profile
+            endpoints.append({
+                'direction': direction, 'node': endpoint.node_namespace.rstrip('/') + '/' + endpoint.node_name,
+                'type': endpoint.topic_type, 'reliability': qos.reliability.name,
+                'history': qos.history.name, 'depth': qos.depth, 'durability': qos.durability.name,
+                'deadline': qos.deadline.nanoseconds, 'lifespan': qos.lifespan.nanoseconds,
+                'liveliness': qos.liveliness.name, 'lease': qos.liveliness_lease_duration.nanoseconds,
+            })
+    return endpoints
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["topics", "hz", "watch", "stamps"])
+    parser.add_argument("mode", choices=["topics", "hz", "watch", "stamps", "qos"])
     parser.add_argument("--control")
     parser.add_argument("--hidden", action="store_true")
     parser.add_argument("--topic", default="")
@@ -118,6 +134,14 @@ def main():
         until = time.monotonic() + 1.2
         while time.monotonic() < until:
             executor.spin_once(timeout_sec=0.1)
+        if args.mode == 'qos':
+            from rclpy.utilities import get_rmw_implementation_identifier
+            names = sorted(name for name, _ in node.get_topic_names_and_types())
+            preferred = next((name for name in names if name not in ('/rosout', '/parameter_events')), '')
+            topic = args.topic or ('/iv_points' if '/iv_points' in names else preferred)
+            emit({'rmw': get_rmw_implementation_identifier(), 'names': names, 'topic': topic,
+                  'endpoints': endpoint_qos(node, topic) if topic in names else []})
+            return 0
         topics = []
         for name, types in sorted(node.get_topic_names_and_types()):
             if not args.hidden and any(part.startswith('_') for part in name.split('/')):

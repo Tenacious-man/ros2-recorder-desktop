@@ -1,4 +1,5 @@
 import os
+import shlex
 import time
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -7,6 +8,10 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QApplication, QDialogButtonBox
 
 from ros2_recorder.app import MainWindow, configure_style
+from ros2_recorder.communication import CommunicationSettings
+from ros2_recorder.communication_dialog import CommunicationComparison, CommunicationDialog
+from ros2_recorder.host_diagnostics import dds_profile
+from ros2_recorder.live_stamp_page import LOCAL_REFERENCE
 
 
 def pump(app, condition, timeout=5):
@@ -19,12 +24,13 @@ def pump(app, condition, timeout=5):
 
 
 class FakeMonitor:
-    def __init__(self, env, topics, *, on_snapshot, on_done):
+    def __init__(self, env, topics, *, on_snapshot, on_done, settings=None):
         self.topics = {}
         self.tokens = {}
         self.counter = self.generation = 0
         self.stopping = False
         self.started = False
+        self.settings = settings
         self.on_snapshot, self.on_done = on_snapshot, on_done
         self.update(topics)
 
@@ -78,11 +84,12 @@ def check_draft(dialog, name, checked):
     dialog.table.item(dialog.rows[name], 0).setCheckState(Qt.Checked if checked else Qt.Unchecked)
 
 
-def snapshot(monitor, values, *, age_ns=0):
+def snapshot(monitor, values, *, age_ns=0, wall_times=None):
     now = time.monotonic_ns() - age_ns
     return {'generation': monitor.generation,
             'samples': {name: {'stamp_ns': value, 'status': 'ok' if value else 'invalid',
                                'error': '' if value else 'header.stamp 为零', 'received_ns': now,
+                               'received_wall_ns': (wall_times or {}).get(name),
                                'received_count': 1, 'token': monitor.tokens[name]}
                         for name, value in values.items()}}
 
@@ -90,7 +97,8 @@ def snapshot(monitor, values, *, age_ns=0):
 def test_live_selection_reference_sign_and_stale_last_arrivals(tmp_path, monkeypatch):
     app, window, page = make_window(tmp_path, monkeypatch)
     try:
-        assert not page.start_button.isEnabled() and page.reference.count() == 0
+        assert not page.start_button.isEnabled() and page.reference.count() == 1
+        assert page.local_clock.text().startswith('本机当前时间（Unix 秒）')
         select(page, ['/camera', '/radar', '/lidar'])
         page.start_button.click()
         pump(app, lambda: page.monitor is not None and page.monitor.started)
@@ -98,23 +106,33 @@ def test_live_selection_reference_sign_and_stale_last_arrivals(tmp_path, monkeyp
         assert window.frequency_suspended
         base = 1_793_581_200_123_456_789
         values = {'/camera': base, '/radar': base + 7_250_000, '/lidar': base - 3_500_000}
-        monitor.on_snapshot(snapshot(monitor, values))
+        wall_times = {'/camera': base + 1_125_000, '/radar': base + 5_000_000, '/lidar': base}
+        monitor.on_snapshot(snapshot(monitor, values, wall_times=wall_times))
         app.processEvents()
-        assert page.table.item(page.rows['/radar'], 2).text() == '+7.250'
-        assert page.table.item(page.rows['/lidar'], 2).text() == '-3.500'
+        assert page.reference.currentData() == LOCAL_REFERENCE
+        assert page.table.item(page.rows['/camera'], 2).text() == '1793581200.124581789'
+        assert page.table.item(page.rows['/camera'], 3).text() == '-1.125'
+        assert page.table.item(page.rows['/radar'], 3).text() == '+2.250'
+        assert page.table.item(page.rows['/lidar'], 3).text() == '-3.500'
         assert page.table.item(page.rows['/camera'], 1).text() == '1793581200.123456789'
+        page.reference.setCurrentIndex(page.reference.findData('/camera'))
+        assert page.table.item(page.rows['/radar'], 3).text() == '+7.250'
+        assert page.table.item(page.rows['/lidar'], 3).text() == '-3.500'
         page.reference.setCurrentIndex(page.reference.findData('/radar'))
-        assert page.table.item(page.rows['/camera'], 2).text() == '-7.250'
-        assert page.table.item(page.rows['/radar'], 2).text() == '0.000'
-        assert page.table.item(page.rows['/lidar'], 2).text() == '-10.750'
+        assert page.table.item(page.rows['/camera'], 3).text() == '-7.250'
+        assert page.table.item(page.rows['/radar'], 3).text() == '0.000'
+        assert page.table.item(page.rows['/lidar'], 3).text() == '-10.750'
         monitor.on_snapshot(snapshot(monitor, values, age_ns=3_000_000_000))
         app.processEvents()
-        assert '未更新' in page.table.item(page.rows['/camera'], 3).text()
+        assert '未更新' in page.table.item(page.rows['/camera'], 4).text()
         # A reference arriving with a zero time invalidates all comparisons.
-        monitor.on_snapshot(snapshot(monitor, dict(values, **{'/radar': 0})))
+        monitor.on_snapshot(snapshot(monitor, dict(values, **{'/radar': 0}), wall_times=wall_times))
         app.processEvents()
         assert page.table.item(page.rows['/radar'], 1).text() == '0.000000000'
-        assert all(page.table.item(row, 2).text() == '—' for row in page.rows.values())
+        assert all(page.table.item(row, 3).text() == '—' for row in page.rows.values())
+        page.reference.setCurrentIndex(0)
+        assert page.table.item(page.rows['/radar'], 2).text() == '1793581200.128456789'
+        assert page.table.item(page.rows['/radar'], 3).text() == '—'
         errors = []
         window._error = errors.append
         window.start_recording()
@@ -130,6 +148,128 @@ def test_live_selection_reference_sign_and_stale_last_arrivals(tmp_path, monkeyp
         pump(app, lambda: not page.busy)
         assert not window.frequency_suspended
         assert page.samples['/camera']['stamp_ns'] == base
+        assert page.table.item(page.rows['/camera'], 3).text() == '-1.125'
+    finally:
+        window.close()
+        pump(app, lambda: not window.isVisible())
+
+
+def test_communication_settings_and_baseline_keep_each_runs_qos(tmp_path, monkeypatch):
+    app, window, page = make_window(tmp_path, monkeypatch)
+    try:
+        select(page, ['/radar'])
+        dialog = CommunicationDialog(page, page.communication)
+        dialog.form.use_lidar_preset()
+        dialog.form.duration.setValue(1)
+        dialog.form.run_note.setText('发布端 8 MiB')
+        monkeypatch.setattr('ros2_recorder.live_stamp_page.CommunicationDialog', lambda *args: dialog)
+        monkeypatch.setattr(dialog, 'exec_', lambda: dialog.Accepted)
+        page.choose_communication()
+        assert CommunicationSettings.load(page.communication_path) == dialog.settings()
+        page.start()
+        pump(app, lambda: page.monitor is not None)
+        monitor = page.monitor
+        assert monitor.settings.depth == 2 and monitor.settings.transport == 'shm'
+        data = snapshot(monitor, {'/radar': 100_000_000_000})
+        data['samples']['/radar'].update(seconds=.9, hz=9.8, max_gap_ms=104.3, age_p99_ms=57.1)
+        page.accept_snapshot(monitor, data)
+        pump(app, lambda: not page.busy)
+        page.baseline_button.click()
+        dialog.form.reliability.setCurrentIndex(dialog.form.reliability.findData('reliable'))
+        page.choose_communication()
+        page.start()
+        pump(app, lambda: page.monitor is not None)
+        monitor = page.monitor
+        assert monitor.settings.reliability == 'reliable'
+        data = snapshot(monitor, {'/radar': 102_000_000_000})
+        data['samples']['/radar'].update(seconds=.9, hz=10.0)
+        page.accept_snapshot(monitor, data)
+        comparison = CommunicationComparison(page, page.baseline, page.current_run())
+        assert 'Best Effort' in comparison.table.item(1, 0).text()
+        assert 'Reliable' in comparison.table.item(1, 1).text()
+        assert '发布端 8 MiB' in comparison.table.item(0, 0).text()
+        assert comparison.table.item(8, 0).text() == '9.80 Hz'
+        assert comparison.table.item(8, 1).text() == '10.00 Hz'
+    finally:
+        window.close()
+        pump(app, lambda: not window.isVisible())
+
+
+def test_host_diagnostics_shows_running_process_and_graph_without_listening(tmp_path, monkeypatch):
+    app, window, page = make_window(tmp_path, monkeypatch)
+    try:
+        monkeypatch.setattr('ros2_recorder.host_diagnostics_dialog.host_report',
+                            lambda env: ('ROS Domain ' + env['ROS_DOMAIN_ID'], 'seyond_node · 536 KiB'))
+        requests = []
+
+        def graph(env, *args):
+            requests.append(args)
+            topic = args[-1] or '/camera'
+            return {'rmw': 'rmw_fastrtps_cpp', 'names': ['/camera', '/lidar'], 'topic': topic,
+                    'endpoints': [{'direction': '发布', 'node': topic, 'type': 'sensor_msgs/msg/Image',
+                                   'reliability': 'RELIABLE', 'history': 'UNKNOWN', 'depth': 0,
+                                   'durability': 'VOLATILE', 'deadline': 2**63 - 1, 'lifespan': 0,
+                                   'liveliness': 'AUTOMATIC', 'lease': 0}]}
+
+        monkeypatch.setattr('ros2_recorder.host_diagnostics_dialog.graph_probe', graph)
+        window._unlock_admin()
+        window.nav.setCurrentRow(7)
+        module = window.communication_widget
+        module.tabs.setCurrentWidget(module.diagnostics)
+        dialog = module.diagnostics
+        pump(app, lambda: dialog.refresh_button.isEnabled())
+        assert 'ROS Domain 177' in dialog.overview.toPlainText()
+        assert 'seyond_node' in dialog.processes.toPlainText()
+        assert '深度 未报告' in dialog.qos.toPlainText()
+        assert '更新时限 无限' in dialog.qos.toPlainText()
+        dialog.topic.setCurrentText('/lidar')
+        pump(app, lambda: dialog.refresh_button.isEnabled())
+        assert requests[-1] == ('qos', '--topic', '/lidar')
+        dialog.copy_report()
+        assert '话题 QoS · /lidar' in app.clipboard().text()
+        assert page.monitor is None and not page.busy
+    finally:
+        window.close()
+        pump(app, lambda: not window.isVisible())
+
+
+def test_admin_communication_page_deploys_and_revokes_account_defaults(tmp_path, monkeypatch):
+    app, window, page = make_window(tmp_path, monkeypatch)
+    try:
+        monkeypatch.setattr('ros2_recorder.communication_dialog.host_limits', lambda: (32768, 208))
+        window._unlock_admin()
+        window.nav.setCurrentRow(7)
+        module = window.communication_widget
+        assert module.isVisible()
+        module.form.udp.setValue(1024)
+        assert not module.form.copy_linux.isHidden()
+        module.form.copy_linux.click()
+        assert app.clipboard().text() == 'sudo sysctl -w net.core.rmem_max=1048576'
+
+        exported = tmp_path / 'Seyond Fast DDS.xml'
+        monkeypatch.setattr('ros2_recorder.communication_dialog.QFileDialog.getSaveFileName',
+                            lambda *args: (str(exported), 'XML 文件 (*.xml)'))
+        module.form.export_profile()
+        assert '共享内存段 8 MiB' in dds_profile(exported)
+        assert shlex.split(app.clipboard().text()) == [f'FASTRTPS_DEFAULT_PROFILES_FILE={exported}',
+                                                       'ros2', 'launch', 'seyond', 'start.py']
+
+        module.enable_button.click()
+        assert module.profile.active()
+        assert module.profile.settings().udp_kib == 1024
+        assert '共享内存段 8 MiB' in dds_profile(module.profile.xml_path)
+        module.copy_button.click()
+        assert shlex.split(app.clipboard().text())[1] == f'FASTRTPS_DEFAULT_PROFILES_FILE={module.profile.xml_path}'
+        assert page.communication.transport == 'environment'
+        module.disable_button.click()
+        assert not module.profile.active()
+        assert module.profile.xml_path.is_file()
+        module.profile.env_path.write_text('# Existing external file\n')
+        module.enable_button.click()
+        assert module.profile.env_path.read_text() == '# Existing external file\n'
+        assert '已有其他配置' in module.message.text()
+        window._lock_admin()
+        assert not module.isVisible() and window.nav.item(7).isHidden()
     finally:
         window.close()
         pump(app, lambda: not window.isVisible())
@@ -141,10 +281,11 @@ def test_stale_generations_reference_removal_and_close_cleanup(tmp_path, monkeyp
     page.start()
     pump(app, lambda: page.monitor is not None)
     monitor = page.monitor
+    page.reference.setCurrentIndex(page.reference.findData('/camera'))
     previous = snapshot(monitor, {'/camera': 100_000_000_000, '/radar': 100_001_000_000})
     page.accept_snapshot(monitor, previous)
     select(page, ['/radar'])
-    assert page.reference.currentData() == '/radar'
+    assert page.reference.currentData() == LOCAL_REFERENCE
     select(page, ['/radar', '/camera'])
     assert '/camera' not in page.samples
     page.accept_snapshot(monitor, previous)
@@ -201,7 +342,7 @@ def test_topic_dialog_confirm_cancel_and_only_selected_main_rows(tmp_path, monke
         assert not dialog.isVisible()
         assert set(page.rows) == {'/camera', '/radar'} and page.table.rowCount() == 2
         assert not page.table.item(page.rows['/camera'], 0).flags() & Qt.ItemIsUserCheckable
-        assert page.reference.currentData() == '/camera'
+        assert page.reference.currentData() == LOCAL_REFERENCE
         assert page.result_stack.currentWidget() is page.table
         page.select_button.click()
         dialog = page.topic_dialog
@@ -211,7 +352,7 @@ def test_topic_dialog_confirm_cancel_and_only_selected_main_rows(tmp_path, monke
         dialog.buttons.button(QDialogButtonBox.Cancel).click()
         assert not dialog.isVisible()
         assert set(page.rows) == {'/camera', '/radar'}
-        assert page.reference.currentData() == '/camera'
+        assert page.reference.currentData() == LOCAL_REFERENCE
         page.set_discovered_topics(list(page.catalog.values()) + [
             {'name': '/unwanted', 'types': ['std_msgs/msg/String'], 'publishers': 1, 'available': True}])
         assert '/unwanted' in page.catalog and '/unwanted' not in page.rows
@@ -251,7 +392,7 @@ def test_live_dialog_changes_are_atomic_and_preserve_kept_samples(tmp_path, monk
             check_draft(dialog, name, False)
         dialog.buttons.button(QDialogButtonBox.Ok).click()
         assert page.table.rowCount() == 0 and monitor.topics == {} and page.samples == {}
-        assert page.reference.count() == 0
+        assert page.reference.count() == 1
         assert page.result_stack.currentWidget() is page.empty_hint
     finally:
         window.close()
@@ -396,6 +537,7 @@ def test_row_drag_keeps_latest_samples_reference_and_subscriptions(tmp_path, mon
         page.start()
         pump(app, lambda: page.monitor is not None)
         monitor = page.monitor
+        page.reference.setCurrentIndex(page.reference.findData('/camera'))
         values = {'/camera': 100_000_000_000, '/lidar': 99_996_500_000, '/radar': 100_007_250_000}
         page.accept_snapshot(monitor, snapshot(monitor, values))
         generation, tokens = monitor.generation, dict(monitor.tokens)
@@ -455,8 +597,8 @@ def test_row_drag_keeps_latest_samples_reference_and_subscriptions(tmp_path, mon
         assert monitor.generation == generation and monitor.tokens == tokens
         assert page.monitor is monitor and not monitor.stopping
         assert page.table.item(page.rows['/camera'], 1).text() == '101.000000000'
-        assert page.table.item(page.rows['/lidar'], 2).text() == '-3.500'
-        assert page.table.item(page.rows['/radar'], 2).text() == '+7.250'
+        assert page.table.item(page.rows['/lidar'], 3).text() == '-3.500'
+        assert page.table.item(page.rows['/radar'], 3).text() == '+7.250'
         page.render_samples()
         page.set_discovered_topics(list(page.catalog.values()) + [
             {'name': '/a_new_camera', 'types': ['sensor_msgs/msg/Image'], 'publishers': 1, 'available': True}])

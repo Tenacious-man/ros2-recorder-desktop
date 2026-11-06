@@ -177,7 +177,9 @@ class MainWindow(QMainWindow):
         self.admin_unlocked = False
         self.admin_dialog = None
         self.admin_rows = []
+        self.timing_widget = None
         self.calibration_widget = None
+        self.communication_widget = None
         self.signals = Signals(self)
         self.signals.line.connect(self._record_line)
         self.signals.done.connect(self._record_done)
@@ -288,15 +290,20 @@ class MainWindow(QMainWindow):
         self.admin_unlocked = True
         if not self.admin_rows:
             for title, subtitle in (
-                ("设备授时", "管理员功能 · 尚未接入硬件授时；后续按设备型号和网口适配。"),
+                ("设备授时", ""),
                 ("点云标定", "双点云手动外参标定"),
+                ("通信环境", ""),
                 ("管理员设置", "管理员模式仅对本次运行有效，退出或重启后自动隐藏功能入口。"),
             ):
                 page = QWidget()
                 layout = QVBoxLayout(page)
                 layout.setContentsMargins(16, 12, 16, 12)
                 layout.setSpacing(8)
-                if title == "点云标定":
+                if title == "设备授时":
+                    from .device_timing_page import DeviceTimingPage
+                    self.timing_widget = DeviceTimingPage(self)
+                    layout.addWidget(self.timing_widget, 1)
+                elif title == "点云标定":
                     try:
                         from .calibration_page import CalibrationPage
                         self.calibration_widget = CalibrationPage(self)
@@ -304,6 +311,10 @@ class MainWindow(QMainWindow):
                         layout.addWidget(self.calibration_widget)
                     except ImportError:
                         self._heading(layout, title, "标定依赖未安装。请安装 python3-numpy 后重启软件。")
+                elif title == "通信环境":
+                    from .communication_page import CommunicationPage
+                    self.communication_widget = CommunicationPage(self)
+                    layout.addWidget(self.communication_widget, 1)
                 else:
                     self._heading(layout, title, subtitle)
                 if title == "管理员设置":
@@ -312,7 +323,7 @@ class MainWindow(QMainWindow):
                     actions.addWidget(button("退出管理员模式", self._lock_admin))
                     actions.addStretch()
                     layout.addLayout(actions)
-                if title != "点云标定":
+                if title == "管理员设置":
                     layout.addStretch()
                 row = self.stack.addWidget(page)
                 item = QListWidgetItem(title)
@@ -729,6 +740,8 @@ class MainWindow(QMainWindow):
         self.load_profile_button.setText("加载中…" if self.env_busy else "加载")
         self.load_profile_button.setToolTip(message or "应用配置方案；相同的消息环境会直接复用。")
         self.load_profile_from_list_button.setToolTip(message)
+        if self.timing_widget:
+            self.timing_widget.update_controls()
         if self.calibration_widget:
             self.calibration_widget.update_controls()
 
@@ -748,6 +761,8 @@ class MainWindow(QMainWindow):
             self.nav.setCurrentRow(0)
             return
         self.stack.setCurrentIndex(index)
+        if self.timing_widget:
+            self.timing_widget.set_active(index == 5)
         if self.calibration_widget:
             self.calibration_widget.set_active(index == 6)
         if index == 1 and hasattr(self, 'history_root') and not self.history_root.text():
@@ -1511,6 +1526,9 @@ class MainWindow(QMainWindow):
             self._error(str(exc))
 
     def start_recording(self):
+        if self.timing_widget and self.timing_widget.changing:
+            self._error("正在启停 PTP 广播，请等待操作完成后再录制。")
+            return
         if self._busy_guard():
             return
         if not self.active_env:
@@ -1938,6 +1956,8 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.analysis_widget.dispose()
+        if self.timing_widget:
+            self.timing_widget.set_active(False)
         if self.calibration_widget:
             self.calibration_widget.dispose()
         event.accept()
