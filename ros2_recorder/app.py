@@ -17,16 +17,19 @@ import uuid
 from PyQt5.QtCore import Qt, QTimer, QUrl, QSize
 from PyQt5.QtGui import QColor, QDesktopServices, QFont, QPalette, QIcon
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget, QSizePolicy,
 )
 
-from .config import MIB, ProfileStore, RecordConfig, atomic_json, import_command
+from .config import ProfileStore, RecordConfig, atomic_json, import_command
+from .capacity_widget import CapacitySpinBox
+from .units import DECIMAL_BYTES, GIB, MIB, format_capacity, format_size
 from .environment import (
-    build_command, discover_topics, inspect_workspace, load_environment, validate_message_types, installed_environments,
+    build_command, discover_topics, inspect_workspace, installed_environments, installed_interface_packages,
+    load_environment, validate_message_types, workspace_build_root,
 )
 from .processes import ProcessRunner
 from .recording import RecordingSession, benchmark_directory, list_sessions, prepare_recording_qos, validate_recording_qos
@@ -36,7 +39,7 @@ from .compatibility import detect_capabilities
 from .tasks import Signals, Task
 from .summary_dialog import RecordingSummaryDialog
 from .live_stamp_page import LiveStampPage
-from .item_delegate import TopicItemDelegate
+from .item_delegate import configure_checkable_rows
 from .admin_access import AdminCredentials
 from .admin_ui import AdminEntryLabel, AdminPasswordDialog
 
@@ -120,13 +123,11 @@ def table(headers):
 
 
 def size_text(value):
-    if value >= 1024**3:
-        return f"{value / 1024**3:.2f} GiB"
-    return f"{value / MIB:.1f} MiB"
+    return format_size(value, minimum='MB')
 
 
 def disk_space_text(value):
-    return f"{value / 1_000_000_000:.2f} GB"
+    return format_capacity(value, 'GB')
 
 
 class MainWindow(QMainWindow):
@@ -408,8 +409,7 @@ class MainWindow(QMainWindow):
         self.clear_visible_button.setProperty('compact', True)
         self.topic_table = table(["录制", "话题名称", "消息类型", "发布端", "发布可靠性", "接收频率", "检测"])
         self.topic_table.setObjectName("topicTable")
-        self.topic_table.setItemDelegate(TopicItemDelegate(self.topic_table))
-        self.topic_table.setStyleSheet('QTableWidget::indicator { width: 20px; height: 20px; }')
+        configure_checkable_rows(self.topic_table)
         self.topic_table.setMinimumHeight(85)
         self.topic_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.topic_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
@@ -467,13 +467,13 @@ class MainWindow(QMainWindow):
         self.preset = QComboBox()
         settings.addRow("存储预设", self.preset)
         self.preset.currentTextChanged.connect(self._preset_hint)
-        self.cache = spin(512, 4095, " MiB")
+        self.cache = CapacitySpinBox(512, 0, 4095, MIB, 'MB')
         settings.addRow("写入缓存", self.cache)
         self.cache_messages = spin(100, 100000000, " 条")
         settings.addRow("缓存消息数", self.cache_messages)
         self.cache_messages.hide()
         settings.labelForField(self.cache_messages).hide()
-        self.split_size = spin(4096, 1048576, " MiB")
+        self.split_size = CapacitySpinBox(4096, 0, 1048576, MIB, 'MB')
         self.split_size.setSpecialValueText("不按大小分包")
         settings.addRow("分包大小", self.split_size)
         self.advanced_toggle = QCheckBox("展开高级参数")
@@ -482,14 +482,14 @@ class MainWindow(QMainWindow):
         self.advanced_form = advanced_form
         advanced_form.setContentsMargins(0, 0, 0, 0)
         self.cache_bytes = QLineEdit()
-        self.cache_bytes.setPlaceholderText("留空采用 MiB 值")
-        self.cache_bytes.setToolTip("导入旧命令时保留原始字节数；修改上方 MiB 值会清除此覆盖值。")
+        self.cache_bytes.setPlaceholderText("留空采用上方 MB 设置")
+        self.cache_bytes.setToolTip("导入旧命令时保留原始字节数；修改上方缓存大小会清除此覆盖值。")
         advanced_form.addRow("精确缓存 / 字节", self.cache_bytes)
         self.split_bytes = QLineEdit()
-        self.split_bytes.setPlaceholderText("留空采用 MiB 值")
+        self.split_bytes.setPlaceholderText("留空采用上方 MB 设置")
         advanced_form.addRow("精确分包 / 字节", self.split_bytes)
-        self.cache.valueChanged.connect(self.cache_bytes.clear)
-        self.split_size.valueChanged.connect(self.split_bytes.clear)
+        self.cache.binary_value_changed.connect(self.cache_bytes.clear)
+        self.split_size.binary_value_changed.connect(self.split_bytes.clear)
         self.split_seconds = spin(0, 2147483647, " 秒")
         self.split_seconds.setSpecialValueText("不按时间分包")
         advanced_form.addRow("分包时长", self.split_seconds)
@@ -512,10 +512,7 @@ class MainWindow(QMainWindow):
         self.use_sim_time = QCheckBox("使用仿真时间（需要 /clock）")
         advanced_form.addRow(self.include_hidden)
         advanced_form.addRow(self.use_sim_time)
-        self.min_free = QDoubleSpinBox()
-        self.min_free.setRange(0, 1000000)
-        self.min_free.setValue(5)
-        self.min_free.setSuffix(" GiB")
+        self.min_free = CapacitySpinBox(5, 0, 1000000, GIB, 'GB', precision=2)
         advanced_form.addRow("预留空间", self.min_free)
         self.auto_stop_disk = QCheckBox("低于预留空间时停止并保存")
         self.auto_stop_disk.setChecked(True)
@@ -587,7 +584,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.record_path_label)
 
     def _environment_page(self, layout):
-        self._heading(layout, "消息环境", "选择已有 ROS 2 消息包或工作空间，编译并加载自定义消息。")
+        self._heading(layout, "消息环境", "选择源码编译，或直接加载已有的 install 环境。")
         box, content = group("工作空间与消息包")
         base_row = QHBoxLayout()
         base_row.addWidget(QLabel('基础 ROS 2 环境'))
@@ -601,19 +598,24 @@ class MainWindow(QMainWindow):
         base_row.addWidget(button('加载基础环境', self.select_base_environment))
         content.addLayout(base_row)
         self.workspace_path = QLineEdit()
-        self.workspace_path.setPlaceholderText("工作空间（含 src）或消息包目录（含 package.xml）")
+        self.workspace_path.setPlaceholderText("工作空间、消息包目录、install 目录或 setup.bash")
         content.addWidget(path_row(self.workspace_path, self.choose_workspace))
         self.scan_button = button("扫描消息包", self.scan_workspace)
+        self.scan_button.setToolTip("扫描待编译的源码包。已有 install 时可直接加载。")
         content.addWidget(self.scan_button)
         self.package_list = QListWidget()
+        configure_checkable_rows(self.package_list)
         self.package_list.setMinimumHeight(80)
         content.addWidget(self.package_list, 1)
         actions = QHBoxLayout()
         self.build_button = button("编译并加载", self.build_workspace, True)
         self.load_button = button("加载已有编译环境", self.load_existing_environment)
+        self.clear_environment_button = button("清除自定义环境", self.clear_message_environment)
+        self.clear_environment_button.setToolTip("切回基础 ROS 2 环境。")
+        self.clear_environment_button.setEnabled(False)
         self.cancel_build_button = button("取消编译", self.cancel_build)
         self.cancel_build_button.setEnabled(False)
-        for b in (self.build_button, self.load_button, self.cancel_build_button):
+        for b in (self.build_button, self.load_button, self.clear_environment_button, self.cancel_build_button):
             actions.addWidget(b)
         content.addLayout(actions)
         self.env_status = text_label("尚未选择自定义消息环境", True)
@@ -740,6 +742,7 @@ class MainWindow(QMainWindow):
         self.load_profile_button.setText("加载中…" if self.env_busy else "加载")
         self.load_profile_button.setToolTip(message or "应用配置方案；相同的消息环境会直接复用。")
         self.load_profile_from_list_button.setToolTip(message)
+        self.clear_environment_button.setEnabled(bool(self.loaded_setup) and not message and not self.pending_close)
         if self.timing_widget:
             self.timing_widget.update_controls()
         if self.calibration_widget:
@@ -846,7 +849,7 @@ class MainWindow(QMainWindow):
             output_root=self.output_root.text().strip(), prefix=self.prefix.text().strip(),
             all_topics=False, topics=sorted(self.selected_topics),
             storage=self.storage.currentText(), preset="" if self.preset.currentIndex() == 0 else self.preset.currentText(),
-            cache_mib=self.cache.value(), split_mib=self.split_size.value(), split_seconds=self.split_seconds.value(),
+            cache_mib=self.cache.binary_value(), split_mib=self.split_size.binary_value(), split_seconds=self.split_seconds.value(),
             cache_messages=self.cache_messages.value(),
             cache_bytes=int(self.cache_bytes.text().strip()) if self.cache_bytes.text().strip() else -1,
             split_bytes=int(self.split_bytes.text().strip()) if self.split_bytes.text().strip() else -1,
@@ -854,7 +857,7 @@ class MainWindow(QMainWindow):
             recording_reliability=self.recording_reliability.currentData(),
             compression_threads=self.compression_threads.value(), qos_path=self.qos_path.text().strip(), qos_enabled=self.qos_enabled.isChecked(),
             storage_config=self.storage_config.text().strip(), storage_config_enabled=self.storage_config_enabled.isChecked(), include_hidden=self.include_hidden.isChecked(),
-            use_sim_time=self.use_sim_time.isChecked(), min_free_gib=self.min_free.value(),
+            use_sim_time=self.use_sim_time.isChecked(), min_free_gib=self.min_free.binary_value(),
             auto_stop_low_disk=self.auto_stop_disk.isChecked(), workspace=self.active_workspace,
             packages=list(self.active_packages), environment_setup=self.loaded_setup,
             auto_detect_frequency=self.auto_frequency.isChecked(),
@@ -874,9 +877,9 @@ class MainWindow(QMainWindow):
         self.storage.setCurrentText(config.storage)
         self._storage_changed()
         self.preset.setCurrentText(config.preset or "默认")
-        self.cache.setValue(config.cache_mib)
+        self.cache.set_binary_value(config.cache_mib)
         self.cache_messages.setValue(config.cache_messages)
-        self.split_size.setValue(config.split_mib)
+        self.split_size.set_binary_value(config.split_mib)
         self.cache_bytes.setText(str(config.cache_bytes) if config.cache_bytes >= 0 else "")
         self.split_bytes.setText(str(config.split_bytes) if config.split_bytes >= 0 else "")
         self.advanced_toggle.setChecked(config.cache_bytes >= 0 or config.split_bytes >= 0
@@ -893,7 +896,7 @@ class MainWindow(QMainWindow):
         self.storage_config_enabled.setChecked(bool(config.storage_config and config.storage_config_enabled))
         self.include_hidden.setChecked(config.include_hidden)
         self.use_sim_time.setChecked(config.use_sim_time)
-        self.min_free.setValue(config.min_free_gib)
+        self.min_free.set_binary_value(config.min_free_gib)
         self.auto_stop_disk.setChecked(config.auto_stop_low_disk)
         self.workspace_path.setText(config.workspace)
         # Detection is a session control: saved recording profiles must not
@@ -966,7 +969,11 @@ class MainWindow(QMainWindow):
         config.packages = []
         self._initialize_environment(config)
 
-    def _request_environment(self, setup, workspace="", packages=None):
+    def clear_message_environment(self):
+        if self.loaded_setup:
+            self._request_environment("", forget_overlay=True)
+
+    def _request_environment(self, setup, workspace="", packages=None, *, forget_overlay=False):
         if self._busy_guard():
             return
         self.stop_all_monitors()
@@ -974,14 +981,20 @@ class MainWindow(QMainWindow):
         self.env_status.setText("正在加载环境并验证录制组件…")
         def work(log):
             env = load_environment(setup, self.base_env)
-            types = validate_message_types(env, packages or [])
-            return env, types, detect_capabilities(env)
+            selected = packages if packages is not None else [p['name'] for p in installed_interface_packages(env, setup)]
+            types = validate_message_types(env, selected) if selected else []
+            return env, selected, types, detect_capabilities(env)
         def loaded(value):
-            env, types, caps = value
+            env, selected, types, caps = value
             self.capabilities = caps
             self._apply_capabilities()
             self.env_busy = False
-            self._set_environment(env, setup, workspace, packages or [])
+            self._set_environment(env, setup, workspace, selected)
+            if forget_overlay:
+                try:
+                    self.store.clear_last_overlay()
+                except OSError as exc:
+                    self._append(self.environment_log, f"警告：无法保存清除环境的设置：{exc}")
             if types:
                 self._append(self.environment_log, f"已验证 {len(types)} 个自定义消息类型：" + ', '.join(types))
         def failed(message):
@@ -1009,6 +1022,7 @@ class MainWindow(QMainWindow):
         self._append(self.environment_log, "已加载：" + label)
         self._render_topics()
         self._notify_stamp_topics()
+        self._update_profile_load_controls()
         if self.auto_discover and not self.pending_close:
             self.refresh_topics(manual=False)
 
@@ -1374,7 +1388,7 @@ class MainWindow(QMainWindow):
         try:
             path = Path(target.text().strip()).expanduser()
             if not path.is_file() or path.stat().st_size > 2 * MIB:
-                raise ValueError("配置文件不存在或超过 2 MiB；请先选择默认文件或浏览文件。")
+                raise ValueError(f"配置文件不存在或超过 {format_capacity(2 * MIB, 'MB')}。请先选择默认文件或浏览文件。")
             dialog = QDialog(self)
             dialog.setWindowTitle("编辑 YAML 配置")
             dialog.resize(760, 560)
@@ -1389,7 +1403,7 @@ class MainWindow(QMainWindow):
                 try:
                     content = editor.toPlainText()
                     if len(content.encode('utf-8')) > 2 * MIB or not isinstance(yaml.safe_load(content), dict):
-                        raise ValueError("配置必须是 YAML 对象，且不超过 2 MiB")
+                        raise ValueError(f"配置必须是 YAML 对象，且不超过 {format_capacity(2 * MIB, 'MB')}")
                     import tempfile
                     with tempfile.NamedTemporaryFile('w', dir=path.parent, encoding='utf-8', delete=False) as stream:
                         temporary = Path(stream.name)
@@ -1415,10 +1429,15 @@ class MainWindow(QMainWindow):
     def choose_workspace(self):
         if self._busy_guard():
             return
-        path = QFileDialog.getExistingDirectory(self, "选择 ROS 2 工作空间或消息包", self.workspace_path.text())
+        path = QFileDialog.getExistingDirectory(self, "选择 ROS 2 工作空间、消息包或 install 目录", self.workspace_path.text())
         if path:
             self.workspace_path.setText(path)
-            self.scan_workspace()
+            directory = Path(path)
+            if (directory / 'src').is_dir() or (directory / 'package.xml').is_file():
+                self.scan_workspace()
+            else:
+                self.workspace = None
+                self.package_list.clear()
 
     def scan_workspace(self):
         if self._busy_guard():
@@ -1510,18 +1529,29 @@ class MainWindow(QMainWindow):
         if self._busy_guard():
             return
         try:
-            workspace = inspect_workspace(self.workspace_path.text().strip(), self.base_env)
-            completed = sorted(workspace.build_root.glob("builds/*/build-success.json"), reverse=True)
-            candidates = [p.parent / "install" / "setup.bash" for p in completed]
-            candidates += [workspace.setup, workspace.path / "install" / "setup.bash"]
-            setup = next((p for p in candidates if p.is_file()), None)
+            raw = self.workspace_path.text().strip()
+            path = Path(raw).expanduser().resolve() if raw else None
+            setup = None
+            workspace = ""
+            if path is not None:
+                if path.suffix == ".bash" and path.is_file():
+                    setup = path
+                elif (path / "setup.bash").is_file():
+                    setup = path / "setup.bash"
+                else:
+                    workspace = str(path)
+                    build_root = workspace_build_root(path, self.base_env)
+                    completed = sorted(build_root.glob("builds/*/build-success.json"), reverse=True)
+                    candidates = [p.parent / "install" / "setup.bash" for p in completed]
+                    candidates += [build_root / "install" / "setup.bash", path / "install" / "setup.bash"]
+                    setup = next((p for p in candidates if p.is_file()), None)
             if setup is None:
-                chosen, _ = QFileDialog.getOpenFileName(self, "选择已编译环境 setup.bash", str(workspace.path), "Bash 环境 (*.bash)")
+                chosen, _ = QFileDialog.getOpenFileName(self, "选择已编译环境 setup.bash", raw, "Bash 环境 (*.bash)")
                 if not chosen:
                     return
                 setup = Path(chosen)
-            selected = [p['name'] for p in workspace.packages if p['interfaces']]
-            self._request_environment(str(setup), str(workspace.path), selected)
+                workspace = ""
+            self._request_environment(str(setup), workspace)
         except Exception as exc:
             self._error(str(exc))
 
@@ -1555,18 +1585,25 @@ class MainWindow(QMainWindow):
             import tempfile
             with tempfile.TemporaryDirectory(prefix='recorder-qos-check-') as directory:
                 caps.command(prepare_recording_qos(config, directory), Path(config.output_root) / 'capability_check')
-            topics = discover_topics(env, config.include_hidden)
-            validate_recording_qos(config, topics)
-            def wanted(t):
-                return t['name'] in config.topics
-            missing = [t['name'] for t in topics if wanted(t) and (not t['available'] or len(t['types']) != 1)]
-            if missing:
-                raise ValueError("以下话题消息类型未加载或存在类型冲突，请先处理消息环境：\n" + '\n'.join(missing))
-            if config.use_sim_time and not any(t['name'] == '/clock' and t['publishers'] for t in topics):
+            warnings = []
+            try:
+                topics = discover_topics(env, config.include_hidden)
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                topics = None
+                warnings.append(f"警告：录制前无法检查话题和消息类型，将继续启动录制：{exc}")
+            validate_recording_qos(config, topics or [])
+            selected = [t for t in (topics or []) if t['name'] in config.topics]
+            unavailable = [t['name'] for t in selected if not t['available']]
+            conflicts = [t['name'] for t in selected if len(t['types']) != 1]
+            if unavailable:
+                warnings.append("警告：以下话题的消息类型未加载，可能无法写入 bag：" + '、'.join(unavailable))
+            if conflicts:
+                warnings.append("警告：以下话题存在消息类型冲突，可能无法写入 bag：" + '、'.join(conflicts))
+            if config.use_sim_time and topics is not None and not any(t['name'] == '/clock' and t['publishers'] for t in topics):
                 log("注意：未发现 /clock 发布端，收到仿真时钟前 rosbag 不会写入消息。")
-            return config, topics, caps
+            return config, topics, caps, warnings
         def done(value):
-            checked, topics, caps = value
+            checked, topics, caps, warnings = value
             self.preflight_busy = False
             if self.pending_close:
                 self.start_button.setEnabled(True)
@@ -1575,9 +1612,12 @@ class MainWindow(QMainWindow):
                 self._resume_frequency_after_recording()
                 return
             try:
+                for warning in warnings:
+                    self._append(self.event_log, warning)
                 self.store.save(checked)
                 self.session = RecordingSession(checked, env, on_line=self.signals.line.emit,
                                                 on_done=self.signals.done.emit, capabilities=caps)
+                self.session.warnings.extend(warnings)
                 self.session.start()
             except Exception as exc:
                 self.session = None
@@ -1588,13 +1628,14 @@ class MainWindow(QMainWindow):
                 self._error(str(exc))
                 return
             self.stop_time = None
-            self.topics = topics
+            if topics is not None:
+                self.topics = topics
             self._set_recording_controls(True)
             self.stop_button.setEnabled(True)
             self.metric_values['state'].setText("进程运行中")
             self.metric_values['time'].setText("00:00:00")
-            self.metric_values['size'].setText("0.0 MiB")
-            self.metric_values['warnings'].setText("0")
+            self.metric_values['size'].setText(size_text(0))
+            self.metric_values['warnings'].setText(str(len(self.session.warnings)))
             self.record_path_label.setText("当前录制：" + str(self.session.output))
             self._append(self.event_log, "开始录制：" + str(self.session.output))
         def failed(message):
@@ -1703,7 +1744,7 @@ class MainWindow(QMainWindow):
                 duration = int(values['elapsed'])
                 self.metric_values['time'].setText(f"{duration // 3600:02}:{duration // 60 % 60:02}:{duration % 60:02}")
                 self.metric_values['size'].setText(size_text(values['size']))
-                self.metric_values['growth'].setText(f"{values['growth_bytes_per_sec'] / MIB:.1f} MiB/s")
+                self.metric_values['growth'].setText(f"{values['growth_bytes_per_sec'] / DECIMAL_BYTES['MB']:.1f} MB/s")
                 self.metric_values['free'].setText(disk_space_text(values['free']))
                 self.metric_values['warnings'].setText(str(values['warning_count']))
                 if session.stopped and not session.finished:
@@ -1730,7 +1771,9 @@ class MainWindow(QMainWindow):
         def done(result):
             self.benchmark_busy = False
             self.speed_button.setEnabled(True)
-            self._append(self.event_log, f"128 MiB 同步写入测速：{result['mib_per_second']:.1f} MiB/s。短时结果受缓存等影响，不能替代持续录制测试。")
+            sample = format_capacity(128 * MIB, 'MB')
+            speed = result['mib_per_second'] * MIB / DECIMAL_BYTES['MB']
+            self._append(self.event_log, f"{sample} 同步写入测速 {speed:.1f} MB/s。短时结果受缓存等影响，不能替代持续录制测试。")
         def failed(message):
             self.benchmark_busy = False
             self.speed_button.setEnabled(True)
@@ -1853,7 +1896,7 @@ class MainWindow(QMainWindow):
             return
         try:
             if Path(path).stat().st_size > MIB:
-                raise ValueError("配置文件超过 1 MiB")
+                raise ValueError(f"配置文件超过 {format_capacity(MIB, 'MB')}")
             config = RecordConfig.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
             self.apply_config(config)
             self.nav.setCurrentRow(0)
@@ -1995,6 +2038,7 @@ def configure_style(app):
         QPushButton[primary=true] { color: #ffffff; background: #176963; border-color: #176963; }
         QPushButton[primary=true]:hover { background: #205c57; }
         QPushButton[primary=true]:disabled { background: #8caeaa; border-color: #8caeaa; }
+        QCheckBox::indicator { width: 20px; height: 20px; }
         QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { padding: 5px; min-height: 22px; border: 1px solid #d7dfe8; border-radius: 4px; background: #ffffff; }
         QPlainTextEdit, QTableWidget, QListWidget { border: 1px solid #e0e5ec; border-radius: 5px; background: #ffffff; }
         QHeaderView::section { background: #f3f6f8; border: 0; padding: 8px 5px; color: #657286; }

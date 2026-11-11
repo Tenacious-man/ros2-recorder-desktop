@@ -2,10 +2,10 @@
 
 ## 使用 deb 安装包（移植到其他电脑）
 
-把 `ros2-recorder-desktop_0.6.0-1_all.deb` 复制到目标 Ubuntu 电脑，在安装包所在目录运行：
+把 `ros2-recorder-desktop_0.7.0-1_all.deb` 复制到目标 Ubuntu 电脑，在安装包所在目录运行：
 
 ```bash
-sudo apt install ./ros2-recorder-desktop_0.6.0-1_all.deb
+sudo apt install ./ros2-recorder-desktop_0.7.0-1_all.deb
 ```
 
 安装后在应用菜单搜索“ROS 2 录制工作台”，或运行 `ros2-recorder`。使用 `apt install` 会按声明补齐缺少的界面依赖，需要可用的软件源和网络；此 deb 不是包含全部依赖的离线安装包。
@@ -22,7 +22,7 @@ ros2-recorder-setup
 ros2-recorder-setup --install-ros
 ```
 
-其他安装选项也可使用，例如 `ros2-recorder-setup --check`、`ros2-recorder-setup --ros-distro jazzy`、`ros2-recorder-setup --workspace "/路径/ros2_ws"`。自定义消息请另行复制消息包/工作空间源码，在目标电脑重新“编译并加载”。
+其他安装选项也可使用，例如 `ros2-recorder-setup --check`、`ros2-recorder-setup --ros-distro jazzy`、`ros2-recorder-setup --workspace "/路径/ros2_ws"`。自定义消息可在目标电脑从源码“编译并加载”，也可部署完整的 `install` 并选择“加载已有编译环境”。复用编译产物时，目标机的 CPU 架构、ROS 2 发行版、运行依赖和 Python 版本须兼容。使用 `--symlink-install` 编译的产物可能依赖源码或构建目录。车上只部署 `install` 时，请使用常规编译产物。
 
 程序文件安装到 `/usr/lib/ros2-recorder`，命令和应用菜单入口由系统管理。deb 不包含录制数据、个人方案或编译缓存。后续升级仍用 `sudo apt install ./新版安装包.deb`；卸载使用 `sudo apt remove ros2-recorder-desktop`，用户的录制数据与个人配置会保留。
 
@@ -36,7 +36,7 @@ ros2-recorder-setup --install-ros
 python3 make_deb.py
 ```
 
-生成目录为 `artifacts/`，同时生成 SHA-256 校验文件；重新发布修改版时可用 `python3 make_deb.py --version 0.6.0-2` 增加包版本。构建使用 `dpkg-deb`，无需管理员权限，不会在本机安装软件。仓库主分支更新应用版本号时，GitHub Actions 会自动构建并发布该版本的 deb 和校验文件。
+生成目录为 `artifacts/`，同时生成 SHA-256 校验文件。重新发布修改版时可用 `python3 make_deb.py --version 0.7.0-2` 增加包版本。构建使用 `dpkg-deb`，无需管理员权限。仓库主分支更新应用版本号时，GitHub Actions 会自动构建并发布该版本的 deb 和校验文件。
 
 ## 使用源码压缩包
 

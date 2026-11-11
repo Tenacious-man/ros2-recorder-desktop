@@ -19,8 +19,10 @@ import yaml
 
 if __package__:
     from .header_stamp import HeaderStampReader
+    from .units import MIB, format_capacity
 else:
     from header_stamp import HeaderStampReader
+    from units import MIB, format_capacity
 
 NS = 1_000_000_000
 MAX_BINS = 600
@@ -36,8 +38,8 @@ def source_files(raw_path):
     warnings = []
     metadata = path / 'metadata.yaml'
     if path.is_dir() and metadata.is_file():
-        if metadata.stat().st_size > 16 * 1024 * 1024:
-            raise ValueError('metadata.yaml 超过 16 MiB，无法读取。')
+        if metadata.stat().st_size > 16 * MIB:
+            raise ValueError(f'metadata.yaml 超过 {format_capacity(16 * MIB, "MB")}，无法读取。')
         data = yaml.safe_load(metadata.read_text(encoding='utf-8'))
         if not isinstance(data, dict) or not isinstance(data.get('rosbag2_bagfile_information'), dict):
             raise ValueError('metadata.yaml 不是有效的 rosbag2 元数据。')

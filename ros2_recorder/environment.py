@@ -23,6 +23,18 @@ class Workspace:
         return self.build_root / "install" / "setup.bash"
 
 
+def workspace_build_root(path: Path, env=None) -> Path:
+    cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    selected_env = os.environ if env is None else env
+    identity = hashlib.sha256((str(path) + '|' + selected_env.get('ROS_DISTRO', '') + '|' + sys.implementation.cache_tag).encode()).hexdigest()[:16]
+    return cache / "ros2-recorder" / "workspaces" / identity
+
+
+def interface_files(package: Path) -> list[str]:
+    return sorted(str(p.relative_to(package)) for folder in ("msg", "srv", "action")
+                  for p in (package / folder).glob('*') if p.is_file())
+
+
 def inspect_workspace(raw_path: str, env=None) -> Workspace:
     path = Path(raw_path).expanduser().resolve()
     if not path.is_dir() or not ((path / "src").is_dir() or (path / "package.xml").is_file()):
@@ -45,18 +57,31 @@ def inspect_workspace(raw_path: str, env=None) -> Workspace:
         import re
         if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]*", name):
             raise ValueError(f"包名称无效：{package}")
-        interfaces = sorted(str(p.relative_to(package)) for folder in ("msg", "srv", "action")
-                            for p in (package / folder).glob('*') if p.is_file())
-        packages.append({"name": name, "path": str(package), "interfaces": interfaces})
+        packages.append({"name": name, "path": str(package), "interfaces": interface_files(package)})
         dirs[:] = []
     if not packages:
         raise ValueError("没有找到可编译的 ROS 2 包")
     if len({p['name'] for p in packages}) != len(packages):
         raise ValueError("工作空间中存在重名包，请先处理后再编译")
-    cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
-    selected_env = os.environ if env is None else env
-    identity = hashlib.sha256((str(path) + '|' + selected_env.get('ROS_DISTRO', '') + '|' + sys.implementation.cache_tag).encode()).hexdigest()[:16]
-    return Workspace(path, sorted(packages, key=lambda p: p['name']), cache / "ros2-recorder" / "workspaces" / identity)
+    return Workspace(path, sorted(packages, key=lambda p: p['name']), workspace_build_root(path, env))
+
+
+def installed_interface_packages(env: dict, setup: str) -> list[dict]:
+    if not setup:
+        return []
+    install = Path(setup).expanduser().resolve().parent
+    packages = {}
+    for raw_prefix in filter(None, env.get('AMENT_PREFIX_PATH', '').split(os.pathsep)):
+        prefix = Path(raw_prefix).resolve()
+        if prefix != install and install not in prefix.parents:
+            continue
+        share = prefix / 'share'
+        for resource in (share / 'ament_index/resource_index/rosidl_interfaces').glob('*'):
+            name = resource.name
+            if name not in packages and resource.is_file():
+                package = share / name
+                packages[name] = {"name": name, "path": str(package), "interfaces": interface_files(package)}
+    return sorted(packages.values(), key=lambda package: package['name'])
 
 
 def installed_environments(root=None):

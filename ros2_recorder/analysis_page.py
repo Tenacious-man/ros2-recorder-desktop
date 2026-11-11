@@ -10,7 +10,7 @@ import threading
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QButtonGroup, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
     QMenu, QProgressBar, QPushButton, QSizePolicy, QSplitter, QToolButton,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
 from .analysis import query_timestamps
 from .analysis_chart import COLORS, METRICS, MetricChart
 from .analysis_job import AnalysisJob
+from .item_delegate import configure_checkable_rows
 
 
 class StatusLabel(QLabel):
@@ -109,9 +110,9 @@ class AnalysisPage(QWidget):
         self.topics = QTreeWidget()
         self.topics.setHeaderHidden(True)
         self.topics.setRootIsDecorated(False)
-        self.topics.setSelectionMode(QAbstractItemView.SingleSelection)
         self.topics.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.topics.setStyleSheet('QTreeWidget::item { padding: 9px 3px; }')
+        configure_checkable_rows(self.topics)
         self.topics.itemChanged.connect(self.show_topics)
         sidebar_layout.addWidget(self.topics, 1)
         self.topic_count = StatusLabel('尚未打开数据')

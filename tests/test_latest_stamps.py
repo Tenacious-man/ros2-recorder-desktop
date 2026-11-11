@@ -61,7 +61,7 @@ def test_control_tokens_do_not_reuse_removed_topics(tmp_path):
         assert (request['reliability'], request['depth']) == ('reliable', 2)
         assert request['topics']['/a']['token'] == monitor.tokens['/a']
         profile = Path(monitor.runner.env[PROFILE_VARIABLE]).read_text()
-        assert '<segment_size>8388608</segment_size>' in profile
+        assert '<segment_size>33554432</segment_size>' in profile
         assert '<receiveBufferSize>262144</receiveBufferSize>' in profile
         with pytest.raises(ValueError, match='仅本机'):
             settings.monitor_environment({'ROS_LOCALHOST_ONLY': '1'}, tmp_path)

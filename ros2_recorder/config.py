@@ -10,7 +10,7 @@ import re
 import shlex
 import tempfile
 
-MIB = 1024 * 1024
+from .units import MIB, format_capacity
 
 
 @dataclass
@@ -107,11 +107,11 @@ class RecordConfig:
                 except re.error as exc:
                     raise ValueError(f"正则表达式无效：{exc}") from exc
         if not 0 <= self.cache_mib <= 4095:
-            raise ValueError("缓存大小必须在 0～4095 MiB 之间")
+            raise ValueError(f"缓存大小必须在 0～{format_capacity(4095 * MIB, 'MB')} 之间")
         if not 0 <= self.cache_messages <= 100000000:
             raise ValueError("缓存消息数超出范围（0～100000000）")
         if not -1 <= self.cache_bytes <= 4294967295:
-            raise ValueError("精确缓存字节数超出范围（0～4294967295，空值表示使用 MiB）")
+            raise ValueError("精确缓存字节数超出范围（0～4294967295，空值表示使用缓存大小设置）")
         if self.split_bytes != -1 and not (self.split_bytes == 0 or 86016 < self.split_bytes <= 2**63 - 1):
             raise ValueError("精确分包字节数必须为 0（不分包）或大于 86016")
         if not 0 <= self.split_mib <= 1048576 or not 0 <= self.split_seconds <= 2147483647:
@@ -254,3 +254,10 @@ class ProfileStore:
         if name:
             self.profiles[name] = self.last.copy()
         atomic_json(self.path, {"version": 1, "last": self.last, "profiles": self.profiles})
+
+    def clear_last_overlay(self):
+        if not isinstance(self.last, dict) or not self.last.get("environment_setup"):
+            return
+        last = dict(self.last, environment_setup="", workspace="", packages=[])
+        atomic_json(self.path, {"version": 1, "last": last, "profiles": self.profiles})
+        self.last = last

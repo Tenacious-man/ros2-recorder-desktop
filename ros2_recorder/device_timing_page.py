@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .device_timing import TimingProfile, change_ports, timing_snapshot
+from .item_delegate import configure_checkable_rows
 
 
 class TimingProfileDialog(QDialog):
@@ -65,6 +66,8 @@ class DeviceTimingPage(QWidget):
         super().__init__(host)
         self.host = host
         self.refreshing = False
+        self.refresh_pending = False
+        self.refresh_invalidated = False
         self.changing = False
         self.ports = {}
         self.checked = set()
@@ -93,7 +96,7 @@ class DeviceTimingPage(QWidget):
         layout.addWidget(self.status)
         actions = QHBoxLayout()
         self.refresh_button = QPushButton('刷新并检查')
-        self.refresh_button.clicked.connect(self.refresh)
+        self.refresh_button.clicked.connect(lambda: self.refresh(manual=True))
         self.start_button = QPushButton('保存并启用')
         self.start_button.clicked.connect(lambda: self._change_output(True))
         self.stop_button = QPushButton('停止并关闭自启')
@@ -107,14 +110,14 @@ class DeviceTimingPage(QWidget):
 
         headers = ('勾选', '网口', '链路', '硬件时钟', '本机授时', '设备锁定', '开机自启')
         self.table = QTableWidget(0, len(headers))
+        configure_checkable_rows(self.table)
         self.table.setHorizontalHeaderLabels(headers)
         self.table.verticalHeader().hide()
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.itemSelectionChanged.connect(self._show_details)
+        self.table.currentItemChanged.connect(self._show_details)
         self.table.itemChanged.connect(self._update_checks)
         layout.addWidget(self.table, 3)
         self.report = QPlainTextEdit('进入页面后读取网口和授时状态。')
@@ -144,13 +147,12 @@ class DeviceTimingPage(QWidget):
 
     def update_controls(self):
         available = self.host.admin_unlocked and not self.changing and not self.host.pending_close
-        idle = available and not self.refreshing
-        can_change = idle and not self.host.is_recording and not self.host.preflight_busy
+        can_change = available and not self.host.is_recording and not self.host.preflight_busy
         selected = [self.ports[name] for name in self.checked if name in self.ports]
-        self.refresh_button.setEnabled(idle)
+        self.refresh_button.setEnabled(available)
         self.start_button.setEnabled(can_change and any(p.phc is not None for p in selected))
         self.stop_button.setEnabled(can_change and any(p.stoppable for p in selected))
-        self.config_button.setEnabled(idle and self._current_name() in self.ports)
+        self.config_button.setEnabled(available and self._current_name() in self.ports)
 
     def _current_name(self):
         item = self.table.item(self.table.currentRow(), 0)
@@ -166,12 +168,25 @@ class DeviceTimingPage(QWidget):
             self.checked.discard(name)
         self.update_controls()
 
-    def refresh(self):
-        if self.refreshing or self.changing or not self.host.admin_unlocked or self.host.pending_close:
+    def refresh(self, manual=False):
+        if self.changing or not self.host.admin_unlocked or self.host.pending_close:
+            return
+        if self.refreshing:
+            self.refresh_pending = self.refresh_pending or manual
             return
         profiles = dict(self.profiles)
         self.refreshing = True
         self.host.run_task(lambda _log: timing_snapshot(profiles), self._show_snapshot, self._snapshot_failed)
+
+    def _finish_refresh(self):
+        self.refreshing = False
+        # A configuration or service change can make the in-flight result stale.
+        invalidated = self.refresh_invalidated
+        retry = invalidated or self.refresh_pending
+        self.refresh_invalidated = self.refresh_pending = False
+        if retry:
+            self.refresh()
+        return not invalidated
 
     def _local_state(self, port):
         if not port.active:
@@ -197,9 +212,11 @@ class DeviceTimingPage(QWidget):
         return 'PHC 已收敛 · 等待发送验证'
 
     def _show_snapshot(self, snapshot):
-        self.refreshing = False
+        if not self._finish_refresh():
+            return
         synced, ports = snapshot
         current = self._current_name()
+        previous_names = tuple(self.ports)
         self.ports = {port.name: port for port in ports}
         for port in ports:
             local = self.profiles.get(port.name)
@@ -216,27 +233,33 @@ class DeviceTimingPage(QWidget):
                 self.traffic[port.name] = tuple(new > old for new, old in zip(port.counters, previous[1]))
         self.previous_counters = next_counters
         sync_label = {'yes': '已同步', 'no': '未同步'}.get(synced, '未知')
-        self.status.setText(f'系统时钟：{sync_label}    更新于 {datetime.now():%H:%M:%S}    勾选要启停的网口，选中行可查看明细。')
+        self.status.setText(f'系统时钟：{sync_label}    更新于 {datetime.now():%H:%M:%S}    点击网口行可切换勾选并查看明细。')
         self.table.blockSignals(True)
-        self.table.setRowCount(len(ports))
-        selection = 0
+        rebuild = tuple(self.ports) != previous_names
+        if rebuild:
+            self.table.setRowCount(0)
+            self.table.setRowCount(len(ports))
         for row, port in enumerate(ports):
-            check = QTableWidgetItem()
-            check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
-            check.setData(Qt.UserRole, port.name)
-            check.setCheckState(Qt.Checked if port.name in self.checked else Qt.Unchecked)
-            self.table.setItem(row, 0, check)
+            if rebuild:
+                check = QTableWidgetItem()
+                check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+                check.setData(Qt.UserRole, port.name)
+                check.setCheckState(Qt.Checked if port.name in self.checked else Qt.Unchecked)
+                self.table.setItem(row, 0, check)
             values = (
                 port.name, {'1': '已连接', '0': '未连接'}.get(port.carrier, '未知'),
                 f'/dev/ptp{port.phc}' if port.phc is not None else '不支持硬件 PTP',
                 self._local_state(port), port.device, '已启用' if port.autostart else '未启用',
             )
             for column, value in enumerate(values, 1):
-                self.table.setItem(row, column, QTableWidgetItem(value))
-            if port.name == current:
-                selection = row
-        if ports:
-            self.table.selectRow(selection)
+                item = self.table.item(row, column)
+                if item is None:
+                    self.table.setItem(row, column, QTableWidgetItem(value))
+                elif item.text() != value:
+                    item.setText(value)
+        if rebuild and ports:
+            names = tuple(self.ports)
+            self.table.setCurrentCell(names.index(current) if current in self.ports else 0, 0)
         self.table.blockSignals(False)
         self._show_details()
 
@@ -268,10 +291,13 @@ class DeviceTimingPage(QWidget):
         lines.append(f'设备端 · {port.device}' + (f' · Falcon {profile.falcon_ip}' if profile.falcon_ip else ''))
         if port.error:
             lines.extend(('', port.error))
-        self.report.setPlainText('\n'.join(lines))
+        details = '\n'.join(lines)
+        if self.report.toPlainText() != details:
+            self.report.setPlainText(details)
 
     def _snapshot_failed(self, error):
-        self.refreshing = False
+        if not self._finish_refresh():
+            return
         self.ports.clear()
         self.previous_counters.clear()
         self.traffic.clear()
@@ -286,6 +312,7 @@ class DeviceTimingPage(QWidget):
         self.timer.stop()
         dialog = TimingProfileDialog(port, self._profile(port), self)
         if dialog.exec() == QDialog.Accepted:
+            self.refresh_invalidated = self.refreshing
             self.profiles[port.name] = dialog.profile
             self.edited.add(port.name)
             for key, value in vars(dialog.profile).items():
@@ -304,6 +331,7 @@ class DeviceTimingPage(QWidget):
             return
         selected = {name: self._profile(self.ports[name]) for name in sorted(self.checked & self.ports.keys())}
         self.changing = True
+        self.refresh_invalidated = self.refreshing
         self.message.setText('正在应用所选网口…')
         self.host.run_task(lambda _log: change_ports(enabled, selected), self._change_finished, self._change_finished)
 

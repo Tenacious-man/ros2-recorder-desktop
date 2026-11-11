@@ -9,10 +9,12 @@ import subprocess
 from xml.etree import ElementTree as ET
 
 from .communication import PROFILE_VARIABLE, host_limits
+from .units import MIB, format_capacity, format_size
 
 
 UNKNOWN = '未读取到'
-PROFILE_KEYS = ('FASTDDS_DEFAULT_PROFILES_FILE', PROFILE_VARIABLE, 'CYCLONEDDS_URI')
+FAST_DDS_PROFILE_KEYS = ('FASTDDS_DEFAULT_PROFILES_FILE', PROFILE_VARIABLE)
+PROFILE_KEYS = (*FAST_DDS_PROFILE_KEYS, 'CYCLONEDDS_URI')
 DISCOVERY_KEYS = ('FASTDDS_BUILTIN_TRANSPORTS', 'ROS_DISCOVERY_SERVER',
                   'ROS_AUTOMATIC_DISCOVERY_RANGE', 'ROS_STATIC_PEERS')
 SCHEDULERS = {0: '普通', 1: 'FIFO', 2: 'RR', 3: 'Batch', 5: 'Idle', 6: 'Deadline'}
@@ -28,22 +30,18 @@ def read_text(path):
 
 
 def size_text(value):
-    if value is None:
-        return UNKNOWN
-    if value >= 1024 ** 2:
-        return f'{value / 1024 ** 2:g} MiB'
-    return f'{value / 1024:g} KiB'
+    return UNKNOWN if value is None else format_size(value)
 
 
 def dds_profile(path):
     """Describe transport descriptors in the file, separate from observed mappings."""
-    if not path.is_file():
-        return 'XML 文件不存在或不可读。'
     try:
+        if not path.is_file():
+            return 'XML 文件不存在或不可读。'
         with path.open('rb') as stream:
-            raw = stream.read(1024 ** 2 + 1)
-        if len(raw) > 1024 ** 2:
-            return 'XML 超过 1 MiB，未展开。'
+            raw = stream.read(MIB + 1)
+        if len(raw) > MIB:
+            return f'XML 超过 {format_capacity(MIB, "MB")}，未展开。'
         root = ET.fromstring(raw)
     except (OSError, ET.ParseError, ValueError) as exc:
         return f'无法读取 XML · {exc}'
@@ -58,7 +56,12 @@ def dds_profile(path):
                            ('发送缓冲请求', 'sendBufferSize')):
             value = descriptor.findtext(key, '').strip()
             if value:
-                options.append(f'{label} {size_text(int(value)) if value.isdecimal() and len(value) <= 12 else value}')
+                if value.isdecimal() and len(value) <= 12:
+                    byte_count = int(value)
+                    value = size_text(byte_count)
+                    if key == 'segment_size' and byte_count >= MIB and byte_count % MIB == 0:
+                        value += f'（{byte_count // MIB} MiB）'
+                options.append(f'{label} {value}')
         lines.append(f'{name} · {kind}' + (' · ' + ' · '.join(options) if options else ''))
     for participant in root.iter('participant'):
         if participant.get('is_default_profile', '').lower() == 'true':
@@ -122,32 +125,49 @@ def local_ros_processes():
     return sorted(programs), clocks
 
 
+def shm_mappings(sizes):
+    return ('，'.join(f'{count} 段（每段 {size_text(size)}）' for size, count in sorted(sizes.items()))
+            or '未发现可读的 Fast DDS 段')
+
+
 def process_report(programs):
     if not programs:
         return '未发现当前账户可读取且已加载已知 DDS 库的进程。'
-    lines = ['范围为当前账户可读取的本机进程。共享内存映射可能含其他参与者，大小含文件管理开销。']
+    lines = ['这里列出本机进程。按话题区分发送方和接收方，请看“话题 QoS”。',
+             'XML 显示文件当前值。每段映射大小含管理开销，同一段也可能被多个进程映射。']
     for pid, name, libraries, env, sizes, cpus, policies in programs:
+        fastdds = any(lib.startswith(('libfastrtps', 'libfastdds')) for lib in libraries)
         scheduling = ', '.join(f'{SCHEDULERS.get(policy, policy)} × {count}'
                                for policy, count in sorted(policies.items()))
-        mappings = ', '.join(f'{size_text(size)} × {count}' for size, count in sorted(sizes.items()))
         lines.extend((
             f'\n{name} · PID {pid}',
             '  已加载中间件库 · ' + ', '.join(libraries),
             f'  启动环境 · ROS {env.get("ROS_DISTRO") or UNKNOWN} · Domain {env.get("ROS_DOMAIN_ID") or "未显式设置"}'
             f' · 仅本机 {env.get("ROS_LOCALHOST_ONLY") or "未显式设置"}'
             f' · RMW {env.get("RMW_IMPLEMENTATION") or "未显式设置"}',
-            f'  共享内存映射 · {mappings or "未发现可读的 Fast DDS 段"}',
             f'  调度 · {scheduling or UNKNOWN} · 主线程可用 CPU {cpus}',
         ))
+        profiles = set()
+        proc = Path('/proc') / str(pid)
         for key in (*PROFILE_KEYS, *DISCOVERY_KEYS):
-            if env.get(key):
-                lines.append(f'  {key} · {env[key]}')
+            value = env.get(key)
+            if not value:
+                continue
+            lines.append(f'  {key} · {value}')
+            if fastdds and key in FAST_DDS_PROFILE_KEYS and value not in profiles:
+                profiles.add(value)
+                path = proc / 'root' / value.lstrip('/') if value.startswith('/') else proc / 'cwd' / value
+                lines.extend('    ' + line for line in dds_profile(path).splitlines())
+        if fastdds:
+            if not profiles:
+                lines.append('  启动环境未指定 Fast DDS XML')
+            lines.append(f'  已映射共享内存段 · {shm_mappings(sizes)}')
     return '\n'.join(lines)
 
 
 def host_report(env):
     programs, clocks = local_ros_processes()
-    shm_mib, _ = host_limits()
+    shm_bytes, _ = host_limits()
     kernel = platform.release()
     realtime = read_text('/sys/kernel/realtime')
     try:
@@ -176,7 +196,7 @@ def host_report(env):
     lines.extend(['', 'Linux 主机',
                   f'  内核 · {kernel} · 实时内核标志 {realtime if realtime is not None else UNKNOWN}',
                   f'  隔离 CPU · {read_text("/sys/devices/system/cpu/isolated") or "无或未读取到"}',
-                  f'  /dev/shm 可用 · {shm_mib if shm_mib is not None else UNKNOWN} MiB'])
+                  f'  /dev/shm 可用 · {size_text(shm_bytes)}'])
     for key in ('rmem_default', 'rmem_max', 'wmem_default', 'wmem_max'):
         value = read_text('/proc/sys/net/core/' + key) or ''
         lines.append(f'  net.core.{key} · {size_text(int(value) if value.isdecimal() else None)}')

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import shlex
 from xml.etree import ElementTree as ET
 
 
@@ -13,6 +14,13 @@ TRANSPORTS = {
 }
 RELIABILITY = {'best_effort': '优先最新（Best Effort）', 'reliable': '允许重传（Reliable）'}
 PROFILE_VARIABLE = 'FASTRTPS_DEFAULT_PROFILES_FILE'
+PROFILE_VARIABLES = (PROFILE_VARIABLE, 'FASTDDS_DEFAULT_PROFILES_FILE')
+DEFAULT_SHM_MIB = 32
+
+
+def profile_shell_command(path):
+    value = shlex.quote(str(path))
+    return 'export ' + ' '.join(f'{key}={value}' for key in PROFILE_VARIABLES)
 
 
 @dataclass(frozen=True)
@@ -20,7 +28,7 @@ class CommunicationSettings:
     reliability: str = 'best_effort'
     depth: int = 5
     transport: str = 'environment'
-    shm_mib: int = 8
+    shm_mib: int = DEFAULT_SHM_MIB
     udp_kib: int = 0
     duration_s: int = 0
     note: str = ''
@@ -74,17 +82,17 @@ class CommunicationSettings:
         path = Path(directory) / 'fastdds.xml'
         path.write_text(self.fastdds_xml(), encoding='utf-8')
         return dict(env, RMW_IMPLEMENTATION=env.get('RMW_IMPLEMENTATION') or 'rmw_fastrtps_cpp',
-                    **{PROFILE_VARIABLE: str(path), 'FASTDDS_DEFAULT_PROFILES_FILE': str(path)})
+                    **dict.fromkeys(PROFILE_VARIABLES, str(path)))
 
 
 def host_limits():
     try:
         shm = os.statvfs('/dev/shm')
-        shm_mib = shm.f_bavail * shm.f_frsize // 1024**2
+        shm_bytes = shm.f_bavail * shm.f_frsize
     except OSError:
-        shm_mib = None
+        shm_bytes = None
     try:
-        udp_kib = int(Path('/proc/sys/net/core/rmem_max').read_text()) // 1024
+        udp_bytes = int(Path('/proc/sys/net/core/rmem_max').read_text())
     except (OSError, ValueError):
-        udp_kib = None
-    return shm_mib, udp_kib
+        udp_bytes = None
+    return shm_bytes, udp_bytes

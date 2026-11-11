@@ -16,7 +16,7 @@ SCENARIOS = """
 <p>先定义应用能容忍的最大帧龄、连续缺帧数和处理时限。以下参数适合开始测量，部署值用实际负载和故障场景验证。</p>
 <h3>同机实时感知 · 点云、图像</h3>
 <p>目标是优先处理新帧。订阅先用 Best Effort、Keep Last 1～2、Volatile。Fast DDS 同机可用 SHM。按最大序列化帧和并发发送留出段容量，实际收到的帧龄和连续缺帧都要记录。</p>
-<p>本机 Seyond 的约 2 MiB 点云曾在默认 512 KiB 段上复现缺帧；8 MiB 在隔离对照中收齐 70 帧。用相同话题和负载给真实发布进程复测。</p>
+<p>本机 Seyond 的约 2.1 MB 点云曾在默认约 524 KB 的段上复现缺帧。段大小约 8.39 MB 时，隔离对照收齐 70 帧。用相同话题和负载给真实发布进程复测。</p>
 <h3>多传感器融合</h3>
 <p>先核对设备时钟基准、header 时间代表的采样时刻和各源频率。队列只容纳配对窗口内需要的帧；按允许时差配对并丢弃过期帧。用配对成功率、时差、等待时间和超时降级验收。</p>
 <h3>控制周期与关键事件</h3>
@@ -51,25 +51,32 @@ PARAMETERS = """
 """
 
 
-def duration_text(ns):
-    if ns >= 2147483647 * 10**9:
-        return '无限'
-    return f'{ns / 1e6:g} ms' if ns > 0 else '默认或未报告'
-
-
 def format_graph(data):
     lines = [f'探测进程实际中间件 · {data["rmw"]} · ROS Domain {data["domain"]}',
-             '此处是 ROS 图发现的发布端和订阅端 QoS。部分中间件不会公布历史深度等参数。']
+             '下方只显示所选话题的发布端和订阅端。Fast DDS XML 和共享内存按进程查看。',
+             '话题 QoS · 历史和深度依赖中间件上报。更新时限、有效期和活性租约仅显示有限值。']
+    roles = {'发布': '发布端（发送）', '订阅': '订阅端（接收）'}
     if not data['endpoints']:
         lines.append('当前话题未发现端点。')
     for item in data['endpoints']:
-        depth = item['depth'] if item['depth'] and item['history'] == 'KEEP_LAST' else '未报告或不适用'
+        history = item['history']
+        if history == 'UNKNOWN':
+            queue = '历史与深度未上报'
+        elif history == 'KEEP_LAST':
+            queue = f'历史 {history} · 深度 {item["depth"] or "未上报"}'
+        else:
+            queue = f'历史 {history}'
+        timing = [
+            f'{label} {item[key] / 1e6:g} ms'
+            for label, key in (('更新时限', 'deadline'), ('有效期', 'lifespan'), ('活性租约', 'lease'))
+            if 0 < item[key] < 2147483647 * 10**9
+        ]
         lines.extend((
-            f'\n{item["direction"]} · {item["node"]} · {item["type"]}',
-            f'  可靠性 {item["reliability"]} · 历史 {item["history"]} · 深度 {depth} · 持久性 {item["durability"]}',
-            f'  更新时限 {duration_text(item["deadline"])} · 有效期 {duration_text(item["lifespan"])}'
-            f' · 活性 {item["liveliness"]} · 租约 {duration_text(item["lease"])}',
+            f'\n{roles[item["direction"]]} · {item["node"]} · {item["type"]}',
+            f'  可靠性 {item["reliability"]} · {queue} · 持久性 {item["durability"]} · 活性 {item["liveliness"]}',
         ))
+        if timing:
+            lines.append('  ' + ' · '.join(timing))
     return '\n'.join(lines)
 
 
@@ -96,6 +103,9 @@ class HostDiagnosticsPanel(QWidget):
         self.topic.setMinimumContentsLength(20)
         self.topic.currentIndexChanged.connect(self.refresh_qos)
         chooser.addWidget(self.topic, 1)
+        self.processes_button = QPushButton('查看进程与共享内存')
+        self.processes_button.clicked.connect(lambda: self.tabs.setCurrentWidget(self.processes))
+        chooser.addWidget(self.processes_button)
         qos_layout.addLayout(chooser)
         self.qos = self.report_view()
         qos_layout.addWidget(self.qos)
@@ -156,14 +166,15 @@ class HostDiagnosticsPanel(QWidget):
             self.overview.setPlainText(reports[0])
             self.processes.setPlainText(reports[1])
         if 'error' in graph:
-            self.qos.setPlainText(graph['error'])
+            qos_text = graph['error']
         else:
             self.topic.blockSignals(True)
             self.topic.clear()
             self.topic.addItems(graph['names'])
             self.topic.setCurrentIndex(self.topic.findText(graph['topic']))
             self.topic.blockSignals(False)
-            self.qos.setPlainText(format_graph(graph))
+            qos_text = format_graph(graph)
+        self.qos.setPlainText(qos_text)
         self.refresh_button.setEnabled(True)
         self.topic.setEnabled(True)
 

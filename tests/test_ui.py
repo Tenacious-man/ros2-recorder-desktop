@@ -1,15 +1,144 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
+from pathlib import Path
+from types import SimpleNamespace
 import time
 import threading
 import pytest
 
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
+from PyQt5.QtTest import QTest
 
 from ros2_recorder.app import MainWindow, configure_style
+from ros2_recorder.capacity_widget import CapacitySpinBox
 from ros2_recorder.config import ProfileStore, RecordConfig, import_command
+from ros2_recorder.environment import workspace_build_root
+from ros2_recorder.units import GIB, MIB
+
+
+def test_capacity_displays_decimal_values_and_preserves_existing_settings():
+    cache = CapacitySpinBox(512, 0, 4095, MIB, 'MB')
+    reserve = CapacitySpinBox(5, 0, 1000000, GIB, 'GB', precision=2)
+    assert cache.text() == '536.87 MB' and cache.binary_value() == 512
+    assert reserve.text() == '5.37 GB' and reserve.binary_value() == 5
+    cache.lineEdit().selectAll()
+    QTest.keyClicks(cache.lineEdit(), '100')
+    QTest.keyClick(cache.lineEdit(), Qt.Key_Return)
+    assert cache.text() == '99.61 MB' and cache.binary_value() == 95
+
+
+@pytest.mark.parametrize('entry', ['workspace', 'install', 'setup', 'cache', 'dialog'])
+def test_load_compiled_environment_without_sources(tmp_path, monkeypatch, entry):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
+    monkeypatch.setenv('XDG_CACHE_HOME', str(tmp_path / 'cache'))
+    monkeypatch.setattr(MainWindow, '_initialize_environment', lambda *args: None)
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(auto_discover=False)
+    window.timer.stop()
+    workspace = tmp_path / 'workspace'
+    install = workspace / 'install'
+    if entry == 'cache':
+        build = workspace_build_root(workspace, window.base_env) / 'builds' / 'latest'
+        build.mkdir(parents=True)
+        (build / 'build-success.json').write_text('{}')
+        install = build / 'install'
+    install.mkdir(parents=True)
+    setup = install / 'setup.bash'
+    setup.touch()
+    entries = {'workspace': workspace, 'install': install, 'setup': setup, 'cache': workspace, 'dialog': ''}
+    window.workspace_path.setText(str(entries[entry]))
+    monkeypatch.setattr('ros2_recorder.app.QFileDialog.getOpenFileName', lambda *args: (str(setup), ''))
+    requests = []
+    monkeypatch.setattr(window, '_request_environment', lambda path, source: requests.append((Path(path), source)))
+    try:
+        window.load_button.click()
+        assert requests == [(setup, str(workspace) if entry in ('workspace', 'cache') else '')]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_clear_overlay_restores_base_and_forgets_last_overlay(tmp_path, monkeypatch):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path))
+    monkeypatch.setattr(MainWindow, '_initialize_environment', lambda *args: None)
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(auto_discover=False)
+    window.timer.stop()
+    app.processEvents()
+    base = {'environment': 'base'}
+    window.base_env = base
+    profile = RecordConfig(all_topics=False, topics=['/sensor'], environment_setup='/overlay/setup.bash',
+                           workspace='/overlay', packages=['sensor_msgs'])
+    window.store.save(profile, 'saved')
+    window._set_environment({'environment': 'overlay'}, profile.environment_setup, profile.workspace, profile.packages)
+    calls = []
+    monkeypatch.setattr('ros2_recorder.app.load_environment', lambda setup, env: calls.append((setup, env)) or env)
+    monkeypatch.setattr('ros2_recorder.app.detect_capabilities', lambda env: None)
+    try:
+        assert window.clear_environment_button.isEnabled()
+        window.clear_environment_button.click()
+        deadline = time.monotonic() + 5
+        while window.tasks:
+            app.processEvents()
+            time.sleep(.01)
+            assert time.monotonic() < deadline
+        assert calls == [('', base)]
+        assert window.active_env == base
+        assert not window.loaded_setup and not window.active_workspace and not window.active_packages
+        assert not window.clear_environment_button.isEnabled()
+        assert not window.selected_topics
+        persisted = ProfileStore(window.store.path)
+        assert persisted.last['environment_setup'] == ''
+        assert persisted.last['topics'] == ['/sensor']
+        assert persisted.profiles['saved']['environment_setup'] == profile.environment_setup
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize('probe_failed', [False, True])
+def test_missing_message_types_warn_without_blocking_recording(tmp_path, monkeypatch, probe_failed):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
+    monkeypatch.setattr(MainWindow, '_initialize_environment', lambda *args: None)
+    caps = SimpleNamespace(command=lambda config, output: config.argv(output))
+    monkeypatch.setattr('ros2_recorder.app.detect_capabilities', lambda env: caps)
+    def discover(*args):
+        if probe_failed:
+            raise RuntimeError('无法检查话题')
+        return [dict(name=name, types=['pkg/msg/Type'], available=available, publishers=1)
+                for name, available in [('/standard', True), ('/custom', False), ('/unselected', False)]]
+    monkeypatch.setattr('ros2_recorder.app.discover_topics', discover)
+    commands = []
+    monkeypatch.setattr('ros2_recorder.recording.ProcessRunner',
+                        lambda argv, env, **kwargs: SimpleNamespace(start=lambda: commands.append(argv)))
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(auto_discover=False)
+    window.timer.stop()
+    app.processEvents()
+    errors = []
+    window._error = errors.append
+    window.base_env = window.active_env = {'ROS_DISTRO': 'humble'}
+    window.apply_config(RecordConfig(output_root=str(tmp_path / 'bags'), min_free_gib=0, all_topics=False,
+                                     topics=['/standard', '/custom']), load_env=False)
+    try:
+        window.start_button.click()
+        deadline = time.monotonic() + 5
+        while window.tasks:
+            app.processEvents()
+            time.sleep(.01)
+            assert time.monotonic() < deadline
+        assert not errors and window.is_recording
+        assert len(commands) == 1 and {'/standard', '/custom'} <= set(commands[0])
+        expected = '无法检查话题' if probe_failed else '消息类型未加载，可能无法写入 bag：/custom'
+        assert len(window.session.warnings) == 1 and expected in window.session.warnings[0]
+        assert expected in window.event_log.toPlainText()
+        assert '/unselected' not in window.event_log.toPlainText()
+    finally:
+        if window.session:
+            window.session.log_file.close()
+            window.session.finished = True
+        window.close()
 
 
 def test_native_workbench_profile_roundtrip_and_monitor_render(tmp_path, monkeypatch):
@@ -30,7 +159,7 @@ def test_native_workbench_profile_roundtrip_and_monitor_render(tmp_path, monkeyp
     assert restored == __import__("dataclasses").replace(
         original, qos_path=window.qos_path.text(), qos_enabled=False,
         storage_config=window.storage_config.text(), storage_config_enabled=False)
-    window.cache.setValue(256)
+    window.cache.set_binary_value(256)
     assert window.get_config().cache_bytes == -1
     window.topics = [{'name': '/radar', 'types': ['radar_msgs/msg/Target'], 'publishers': 1, 'available': False, 'reason': 'not loaded'}]
     window._render_topics()
@@ -138,10 +267,10 @@ def test_legacy_profile_load_applies_parameters_without_resetting_checkboxes(tmp
     window.selected_topics = {'/camera'}
     try:
         for _ in range(2):
-            window.cache.setValue(512)
+            window.cache.set_binary_value(512)
             window._load_profile('test')
-            assert window.cache.value() == 256
-            assert window.split_size.value() == 1024
+            assert window.cache.binary_value() == 256
+            assert window.split_size.binary_value() == 1024
             assert window.prefix.text() == 'test'
             config = window.get_config()
             assert config.topics == ['/camera']
@@ -258,7 +387,7 @@ def test_profiles_only_select_real_topics_without_adding_offline_rows(tmp_path, 
         profile = RecordConfig(all_topics=False, topics=['/lidar', '/offline'], cache_mib=256)
         window.apply_config(profile, load_env=False)
         assert window.get_config().topics == ['/lidar', '/offline']
-        assert window.cache.value() == 256
+        assert window.cache.binary_value() == 256
         assert window.display_topics == [] and window.topic_table.rowCount() == 0
         assert window.topic_count.text() == '显示 0/0 · 已勾选 0'
         window.topics = [dict(name=name, types=['std_msgs/msg/String'], publishers=1, available=True)
@@ -331,9 +460,9 @@ def test_reloading_profile_reuses_active_environment_even_during_discovery(tmp_p
     window.discovery_busy = True
     try:
         for _ in range(2):
-            window.cache.setValue(512)
+            window.cache.set_binary_value(512)
             window.load_profile_button.click()
-            assert window.cache.value() == 256
+            assert window.cache.binary_value() == 256
             assert window.load_profile_button.isEnabled()
             assert not window.env_busy
         assert not requests and not errors

@@ -15,8 +15,9 @@ from .environment import discover_topics
 from .communication import CommunicationSettings, PROFILE_VARIABLE, RELIABILITY, TRANSPORTS
 from .communication_dialog import CommunicationComparison, CommunicationDialog
 from .config import atomic_json
-from .item_delegate import TopicItemDelegate
+from .item_delegate import TopicItemDelegate, configure_checkable_rows
 from .latest_stamps import LatestStampMonitor, format_stamp, latest_difference, sample_status
+from .units import KIB, MIB, format_capacity
 
 LOCAL_REFERENCE = 'local_receipt'
 
@@ -137,7 +138,7 @@ class TopicSelectionDialog(QDialog):
         type_row.addWidget(self.clear_all_button)
         layout.addLayout(type_row)
         self.table = QTableWidget(0, 2)
-        self.table.setItemDelegate(TopicItemDelegate(self.table))
+        configure_checkable_rows(self.table)
         self.table.setHorizontalHeaderLabels(['话题（勾选）', '消息类型'])
         self.table.verticalHeader().hide()
         self.table.setAlternatingRowColors(True)
@@ -574,9 +575,9 @@ class LiveStampPage(QWidget):
         settings = self.communication
         transport = TRANSPORTS[settings.transport]
         if settings.transport == 'shm':
-            transport += f' · SHM {settings.shm_mib} MiB'
+            transport += f' · SHM {format_capacity(settings.shm_mib * MIB, "MB")}'
         if settings.transport != 'environment' and settings.udp_kib:
-            transport += f' · UDP 请求 {settings.udp_kib} KiB'
+            transport += f' · UDP 请求 {format_capacity(settings.udp_kib * KIB, "KB")}'
         if settings.transport == 'environment':
             profile = env.get('FASTDDS_DEFAULT_PROFILES_FILE') or env.get(PROFILE_VARIABLE)
             if profile:

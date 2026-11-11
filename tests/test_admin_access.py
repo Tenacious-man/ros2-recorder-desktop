@@ -240,3 +240,49 @@ def test_device_timing_page_controls_multiple_ports(window, monkeypatch):
     assert not page.timer.isActive()
     page._change_output(True)
     assert len(changes) == 2
+
+
+def test_device_timing_refresh_keeps_clicks_and_discards_stale_results(window, monkeypatch):
+    completions = []
+
+    def defer_task(_function, result=None, failed=None):
+        completions.append(result)
+        window._update_profile_load_controls()
+
+    monkeypatch.setattr(window, 'run_task', defer_task)
+    window._unlock_admin()
+    window.nav.setCurrentRow(5)
+    page = window.timing_widget
+    page.timer.stop()
+    ports = [PortState(name, i, '1', ServiceState(), ServiceState(), ServiceState())
+             for i, name in enumerate(('eth1', 'eth2'))]
+    completions.pop(0)(('yes', ports))
+    QApplication.processEvents()
+
+    page.timer.timeout.emit()
+    assert page.refreshing and page.config_button.isEnabled()
+    page.refresh_button.click()
+    assert len(completions) == 1
+    check = page.table.item(1, 0)
+    viewport = page.table.viewport()
+    point = page.table.visualItemRect(page.table.item(1, 1)).center()
+    QTest.mousePress(viewport, Qt.LeftButton, pos=point)
+    completions.pop(0)(('yes', ports))
+    QTest.mouseRelease(viewport, Qt.LeftButton, pos=point)
+    assert page.table.item(1, 0) is check
+    assert check.checkState() == Qt.Checked
+    assert page.report.toPlainText().startswith('eth2 ·')
+    assert not page.table.selectedItems()
+    assert page.refreshing and len(completions) == 1
+    completions.pop(0)(('yes', ports))
+
+    QTest.mousePress(page.start_button, Qt.LeftButton)
+    page.timer.timeout.emit()
+    QTest.mouseRelease(page.start_button, Qt.LeftButton)
+    assert page.changing and len(completions) == 2
+    completions.pop(1)('操作完成')
+    completions.pop(0)(('yes', []))
+    assert page.table.rowCount() == 2
+    assert page.refreshing and len(completions) == 1
+    completions.pop(0)(('yes', ports))
+    assert not page.refreshing and page.checked == {'eth2'}

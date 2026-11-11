@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import QApplication, QDialogButtonBox
 from ros2_recorder.app import MainWindow, configure_style
 from ros2_recorder.communication import CommunicationSettings
 from ros2_recorder.communication_dialog import CommunicationComparison, CommunicationDialog
-from ros2_recorder.host_diagnostics import dds_profile
+from ros2_recorder.host_diagnostics import dds_profile, process_report
 from ros2_recorder.live_stamp_page import LOCAL_REFERENCE
 
 
@@ -169,7 +169,7 @@ def test_communication_settings_and_baseline_keep_each_runs_qos(tmp_path, monkey
         page.start()
         pump(app, lambda: page.monitor is not None)
         monitor = page.monitor
-        assert monitor.settings.depth == 2 and monitor.settings.transport == 'shm'
+        assert monitor.settings.depth == 2 and monitor.settings.transport == 'shm' and monitor.settings.shm_mib == 32
         data = snapshot(monitor, {'/radar': 100_000_000_000})
         data['samples']['/radar'].update(seconds=.9, hz=9.8, max_gap_ms=104.3, age_p99_ms=57.1)
         page.accept_snapshot(monitor, data)
@@ -198,18 +198,28 @@ def test_communication_settings_and_baseline_keep_each_runs_qos(tmp_path, monkey
 def test_host_diagnostics_shows_running_process_and_graph_without_listening(tmp_path, monkeypatch):
     app, window, page = make_window(tmp_path, monkeypatch)
     try:
+        xml = tmp_path / 'fastdds.xml'
+        xml.write_text(CommunicationSettings(transport='shm', shm_mib=256).fastdds_xml())
+        libraries = ['libfastrtps.so.2.6.12']
+        processes = [
+            (123, 'seyond_node', libraries, {}, {549408: 5, 33579552: 2}, '0-31', {}),
+            (os.getpid(), 'zvlidar_node', libraries,
+             {'FASTDDS_DEFAULT_PROFILES_FILE': str(xml), 'FASTRTPS_DEFAULT_PROFILES_FILE': str(xml)},
+             {268460576: 1}, '0-31', {}),
+        ]
         monkeypatch.setattr('ros2_recorder.host_diagnostics_dialog.host_report',
-                            lambda env: ('ROS Domain ' + env['ROS_DOMAIN_ID'], 'seyond_node · 536 KiB'))
+                            lambda env: ('ROS Domain ' + env['ROS_DOMAIN_ID'], process_report(processes)))
         requests = []
 
         def graph(env, *args):
             requests.append(args)
             topic = args[-1] or '/camera'
+            qos = {'type': 'sensor_msgs/msg/Image', 'reliability': 'RELIABLE', 'history': 'UNKNOWN', 'depth': 0,
+                   'durability': 'VOLATILE', 'deadline': 2**63 - 1, 'lifespan': 250_000_000,
+                   'liveliness': 'AUTOMATIC', 'lease': 0}
             return {'rmw': 'rmw_fastrtps_cpp', 'names': ['/camera', '/lidar'], 'topic': topic,
-                    'endpoints': [{'direction': '发布', 'node': topic, 'type': 'sensor_msgs/msg/Image',
-                                   'reliability': 'RELIABLE', 'history': 'UNKNOWN', 'depth': 0,
-                                   'durability': 'VOLATILE', 'deadline': 2**63 - 1, 'lifespan': 0,
-                                   'liveliness': 'AUTOMATIC', 'lease': 0}]}
+                    'endpoints': [dict(qos, direction='发布', node=topic),
+                                  dict(qos, direction='订阅', node='/recorder_probe_456')]}
 
         monkeypatch.setattr('ros2_recorder.host_diagnostics_dialog.graph_probe', graph)
         window._unlock_admin()
@@ -219,12 +229,26 @@ def test_host_diagnostics_shows_running_process_and_graph_without_listening(tmp_
         dialog = module.diagnostics
         pump(app, lambda: dialog.refresh_button.isEnabled())
         assert 'ROS Domain 177' in dialog.overview.toPlainText()
-        assert 'seyond_node' in dialog.processes.toPlainText()
-        assert '深度 未报告' in dialog.qos.toPlainText()
-        assert '更新时限 无限' in dialog.qos.toPlainText()
+        process_text = dialog.processes.toPlainText()
+        assert 'zvlidar_node' in process_text
+        assert '启动环境未指定 Fast DDS XML' in process_text
+        assert '5 段（每段 549.41 KB），2 段（每段 33.58 MB）' in process_text
+        assert process_text.count('共享内存段 268.44 MB（256 MiB）') == 1
+        assert '已映射共享内存段 · 1 段（每段 268.46 MB）' in process_text
+        report = dialog.qos.toPlainText()
+        assert '发布端（发送） · /camera' in report
+        assert '订阅端（接收） · /recorder_probe_456' in report
+        assert '历史与深度未上报' in report
+        assert '更新时限 无限' not in report
+        assert '有效期 250 ms' in report
+        assert 'zvlidar_node' not in report
+        assert '268.44 MB' not in report
         dialog.topic.setCurrentText('/lidar')
         pump(app, lambda: dialog.refresh_button.isEnabled())
         assert requests[-1] == ('qos', '--topic', '/lidar')
+        assert '发布端（发送） · /lidar' in dialog.qos.toPlainText()
+        dialog.processes_button.click()
+        assert dialog.tabs.currentWidget() is dialog.processes
         dialog.copy_report()
         assert '话题 QoS · /lidar' in app.clipboard().text()
         assert page.monitor is None and not page.busy
@@ -236,28 +260,31 @@ def test_host_diagnostics_shows_running_process_and_graph_without_listening(tmp_
 def test_admin_communication_page_deploys_and_revokes_account_defaults(tmp_path, monkeypatch):
     app, window, page = make_window(tmp_path, monkeypatch)
     try:
-        monkeypatch.setattr('ros2_recorder.communication_dialog.host_limits', lambda: (32768, 208))
+        monkeypatch.setattr('ros2_recorder.communication_dialog.host_limits', lambda: (32 * 1024**3, 208 * 1024))
         window._unlock_admin()
         window.nav.setCurrentRow(7)
         module = window.communication_widget
         assert module.isVisible()
-        module.form.udp.setValue(1024)
+        module.form.udp.set_binary_value(1024)
         assert not module.form.copy_linux.isHidden()
         module.form.copy_linux.click()
         assert app.clipboard().text() == 'sudo sysctl -w net.core.rmem_max=1048576'
 
-        exported = tmp_path / 'Seyond Fast DDS.xml'
+        exported = tmp_path / 'Radar Fast DDS.xml'
         monkeypatch.setattr('ros2_recorder.communication_dialog.QFileDialog.getSaveFileName',
                             lambda *args: (str(exported), 'XML 文件 (*.xml)'))
         module.form.export_profile()
-        assert '共享内存段 8 MiB' in dds_profile(exported)
-        assert shlex.split(app.clipboard().text()) == [f'FASTRTPS_DEFAULT_PROFILES_FILE={exported}',
-                                                       'ros2', 'launch', 'seyond', 'start.py']
+        assert '共享内存段 33.55 MB' in dds_profile(exported)
+        assert '<segment_size>33554432</segment_size>' in exported.read_text()
+        assert shlex.split(app.clipboard().text()) == [
+            'export', f'FASTRTPS_DEFAULT_PROFILES_FILE={exported}', f'FASTDDS_DEFAULT_PROFILES_FILE={exported}',
+        ]
 
+        module.form.shm.set_binary_value(8)
         module.enable_button.click()
         assert module.profile.active()
         assert module.profile.settings().udp_kib == 1024
-        assert '共享内存段 8 MiB' in dds_profile(module.profile.xml_path)
+        assert '共享内存段 8.39 MB' in dds_profile(module.profile.xml_path)
         module.copy_button.click()
         assert shlex.split(app.clipboard().text())[1] == f'FASTRTPS_DEFAULT_PROFILES_FILE={module.profile.xml_path}'
         assert page.communication.transport == 'environment'
@@ -270,6 +297,69 @@ def test_admin_communication_page_deploys_and_revokes_account_defaults(tmp_path,
         assert '已有其他配置' in module.message.text()
         window._lock_admin()
         assert not module.isVisible() and window.nav.item(7).isHidden()
+    finally:
+        window.close()
+        pump(app, lambda: not window.isVisible())
+
+
+def test_communication_startup_fields_export_and_persist(tmp_path, monkeypatch):
+    app, window, _ = make_window(tmp_path, monkeypatch)
+    try:
+        window._unlock_admin()
+        window.nav.setCurrentRow(7)
+        module = window.communication_widget
+        module.tabs.setCurrentIndex(1)
+        form = module.startup_form
+        profile = module.profile
+        assert form.isVisible()
+        assert not form.fields['FASTRTPS_DEFAULT_PROFILES_FILE'][0].isEnabled()
+
+        setup = tmp_path / 'ROS install' / 'setup.bash'
+        form.setup.setEditText(str(setup))
+        form.fields['ROS_DOMAIN_ID'][0].setText('233')
+        module.enable_button.click()
+        assert '0～232' in module.message.text()
+        assert not profile.env_path.exists()
+
+        form.fields['ROS_DOMAIN_ID'][0].setText('17')
+        exported = tmp_path / 'lidar config.xml'
+        monkeypatch.setattr('ros2_recorder.communication_dialog.QFileDialog.getSaveFileName',
+                            lambda *args: (str(exported), 'XML 文件 (*.xml)'))
+        form.copy_button.click()
+        assert shlex.split(app.clipboard().text()) == [
+            'source', str(setup), '&&', 'export', 'ROS_DOMAIN_ID=17',
+            f'FASTRTPS_DEFAULT_PROFILES_FILE={exported}', f'FASTDDS_DEFAULT_PROFILES_FILE={exported}',
+        ]
+        assert exported.is_file()
+        assert not profile.env_path.exists()
+
+        form.profile_source.setCurrentIndex(1)
+        old_xml = form.fields['FASTRTPS_DEFAULT_PROFILES_FILE'][0]
+        assert old_xml.isEnabled()
+        old_xml.setText(str(exported))
+        form.rmw.setEditText('rmw_fastrtps_cpp')
+        form.fields['ROS_DISCOVERY_SERVER'][0].setText('192.168.1.50:11811;;192.168.1.52:11811')
+        expected = form.settings()
+        module.enable_button.click()
+        assert profile.active()
+        assert profile.startup_settings() == expected
+        assert not profile.xml_path.exists()
+        content = profile.env_path.read_text()
+        assert 'ROS_DOMAIN_ID="17"\n' in content
+        assert 'RMW_IMPLEMENTATION="rmw_fastrtps_cpp"\n' in content
+        assert 'ROS_DISCOVERY_SERVER="192.168.1.50:11811;;192.168.1.52:11811"\n' in content
+        assert f'FASTRTPS_DEFAULT_PROFILES_FILE="{exported}"\n' in content
+        assert 'ROS_DISTRO=' not in content
+        assert 'FASTDDS_DEFAULT_PROFILES_FILE=' not in content
+
+        form.fields['ROS_DOMAIN_ID'][0].setText('18')
+        module.copy_button.click()
+        assert shlex.split(app.clipboard().text())[:4] == ['source', str(setup), '&&', 'export']
+        assert 'ROS_DOMAIN_ID=17' in shlex.split(app.clipboard().text())
+        module.disable_button.click()
+        assert not profile.active()
+        assert profile.startup_settings() == expected
+        assert exported.is_file()
     finally:
         window.close()
         pump(app, lambda: not window.isVisible())

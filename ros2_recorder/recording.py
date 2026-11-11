@@ -14,10 +14,11 @@ import time
 
 import yaml
 
-from .config import MIB, RecordConfig, atomic_json
-from .environment import environment_summary, inspect_workspace
+from .config import RecordConfig, atomic_json
+from .environment import environment_summary, inspect_workspace, installed_interface_packages
 from .processes import ProcessRunner
 from .compatibility import detect_capabilities
+from .units import GIB, MIB, format_capacity
 
 
 def folder_size(path: Path) -> int:
@@ -34,7 +35,7 @@ def validate_files(config: RecordConfig):
             continue
         path = Path(raw).expanduser().resolve()
         if not path.is_file() or path.stat().st_size > 2 * MIB:
-            raise ValueError(f"{label} 配置文件不存在，或超过 2 MiB")
+            raise ValueError(f"{label} 配置文件不存在，或超过 {format_capacity(2 * MIB, 'MB')}")
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError(f"{label} 配置必须是 YAML 对象")
@@ -117,7 +118,7 @@ class RecordingSession:
         root.mkdir(parents=True, exist_ok=True)
         self.root_device = root.stat().st_dev
         free = shutil.disk_usage(root).free
-        if free < self.config.min_free_gib * 1024**3:
+        if free < self.config.min_free_gib * GIB:
             raise ValueError("保存目录可用空间低于设定的预留空间，请清理磁盘或修改阈值")
         base_name = f"{self.config.prefix}_{datetime.now():%Y%m%d_%H%M%S}"
         sequence = 0
@@ -145,19 +146,7 @@ class RecordingSession:
                 setattr(effective, field, str(destination))
         effective = prepare_recording_qos(effective, self.session_dir)
         argv = self.capabilities.command(effective, self.output)
-        # Save source interface definitions for future decoding on another machine.
-        if self.config.workspace:
-            workspace = inspect_workspace(self.config.workspace)
-            for package in workspace.packages:
-                if not package['interfaces']:
-                    continue
-                for relative in ["package.xml", *package['interfaces']]:
-                    src = Path(package['path']) / relative
-                    if src.stat().st_size > 2 * MIB:
-                        continue
-                    target = self.session_dir / "interfaces" / package['name'] / relative
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(src, target)
+        self._archive_interfaces()
         atomic_json(self.session_dir / "session.json", {
             "version": 1, "started_at": datetime.now().astimezone().isoformat(),
             "config": self.config.to_dict(), "argv": argv, "command": shlex.join(argv),
@@ -169,6 +158,26 @@ class RecordingSession:
         self._previous = (self.started_at, 0)
         self.runner = ProcessRunner(argv, self.env, line=self._line, done=self._done)
         self.runner.start()
+
+    def _archive_interfaces(self):
+        packages = installed_interface_packages(self.env, self.config.environment_setup)
+        if not packages and self.config.workspace:
+            try:
+                packages = inspect_workspace(self.config.workspace).packages
+            except (OSError, ValueError) as exc:
+                self.warnings.append(f"无法备份工作空间的接口定义：{exc}")
+        for package in packages:
+            if not package['interfaces']:
+                continue
+            for relative in ["package.xml", *package['interfaces']]:
+                src = Path(package['path']) / relative
+                try:
+                    if src.stat().st_size <= 2 * MIB:
+                        target = self.session_dir / "interfaces" / package['name'] / relative
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(src, target)
+                except OSError as exc:
+                    self.warnings.append(f"无法备份 {package['name']}/{relative}：{exc}")
 
     def _line(self, line):
         clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', line)
@@ -215,7 +224,7 @@ class RecordingSession:
         self._previous = now, size
         free = shutil.disk_usage(self.output.parent).free if self.output else 0
         if (not self.finished and not self.stopped and self.config.auto_stop_low_disk
-                and free < self.config.min_free_gib * 1024**3):
+                and free < self.config.min_free_gib * GIB):
             reason = "磁盘余量低于预留阈值，已请求停止并等待文件写完"
             self.warnings.append(reason)
             self.on_line(reason)
@@ -255,10 +264,10 @@ def benchmark_directory(directory: str, log=lambda _: None) -> dict:
     root = Path(directory).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     total = 128 * MIB
-    if shutil.disk_usage(root).free < total + 1024**3:
-        raise ValueError("测速需要至少 1.125 GiB 可用空间")
+    if shutil.disk_usage(root).free < total + GIB:
+        raise ValueError(f"测速需要至少 {format_capacity(total + GIB, 'GB')} 可用空间")
     block = os.urandom(4 * MIB)
-    log("写入 128 MiB 临时数据并同步，结束后自动删除……")
+    log(f"写入 {format_capacity(total, 'MB')} 临时数据并同步，结束后自动删除……")
     started = time.monotonic()
     with tempfile.NamedTemporaryFile(prefix=".ros2-recorder-speed-", dir=root) as f:
         for _ in range(total // len(block)):

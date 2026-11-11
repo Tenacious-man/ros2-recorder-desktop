@@ -1,6 +1,5 @@
 """Controls and comparison views for live communication diagnostics."""
 from pathlib import Path
-import shlex
 
 from PyQt5.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
@@ -8,7 +7,9 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .communication import CommunicationSettings, PROFILE_VARIABLE, RELIABILITY, TRANSPORTS, host_limits
+from .communication import CommunicationSettings, DEFAULT_SHM_MIB, RELIABILITY, TRANSPORTS, host_limits, profile_shell_command
+from .capacity_widget import CapacitySpinBox
+from .units import KIB, MIB, format_capacity, format_size
 
 
 class CommunicationForm(QWidget):
@@ -31,35 +32,46 @@ class CommunicationForm(QWidget):
             self.duration.setSpecialValueText('手动停止')
             self.run_note = QLineEdit(settings.note)
             self.run_note.setMaxLength(120)
-            self.run_note.setPlaceholderText('可选，例如：Seyond 发布端 8 MiB')
+            self.run_note.setPlaceholderText(f'可选，例如：雷达发布端 {format_capacity(DEFAULT_SHM_MIB * MIB, "MB")}')
             form.addRow('对照备注', self.run_note)
         self.transport = QComboBox()
         for key, label in TRANSPORTS.items():
             if not deployment or key != 'environment':
                 self.transport.addItem(label, key)
         self.transport.setCurrentIndex(max(0, self.transport.findData(settings.transport)))
+        self.transport.setToolTip('共享内存传输适合同机进程，UDP 也可用于跨机通信。仅 UDP 可用于对照排查。')
         form.addRow('Fast DDS 传输方式', self.transport)
-        self.shm = self.spin(form, '共享内存段大小', 1, 256, settings.shm_mib, ' MiB')
-        self.udp = self.spin(form, 'UDP 接收缓冲请求值', 0, 65536, settings.udp_kib, ' KiB')
+        self.shm = CapacitySpinBox(settings.shm_mib, 1, 256, MIB, 'MB')
+        self.shm.setToolTip('每个 Fast DDS 参与者创建的共享内存段大小。本机可用共享内存是所有进程共用的总余量。')
+        form.addRow('共享内存段大小', self.shm)
+        self.udp = CapacitySpinBox(settings.udp_kib, 0, 65536, KIB, 'KB')
+        self.udp.setToolTip('Fast DDS 向 Linux 请求的 UDP 套接字接收缓冲。系统默认使用内核默认值，手动值受内核上限约束。')
+        form.addRow('UDP 接收缓冲请求值', self.udp)
         self.udp.setSpecialValueText('系统默认')
         shm, self.udp_limit = host_limits()
         self.limits = QLabel()
         self.limits.setWordWrap(True)
         self.host_text = (
-            f'本机共享内存可用 {shm if shm is not None else "未知"} MiB · '
-            f'Linux UDP 接收缓冲上限 {self.udp_limit if self.udp_limit is not None else "未知"} KiB')
+            f'本机共享内存可用 {format_size(shm) if shm is not None else "未知"} · '
+            f'Linux UDP 接收缓冲上限 {format_size(self.udp_limit) if self.udp_limit is not None else "未知"}')
         layout.addWidget(self.limits)
         self.copy_linux = QPushButton('复制 Linux UDP 上限设置命令')
         self.copy_linux.clicked.connect(self.copy_linux_command)
         layout.addWidget(self.copy_linux)
+        if deployment:
+            field_help = QLabel('共享内存加 UDP 可用于同机点云和跨机通信，仅 UDP 可用于对照排查。'
+                                '共享内存段按 DDS 参与者分配，UDP 缓冲请求值受 Linux 上限约束。')
+            field_help.setWordWrap(True)
+            layout.addWidget(field_help)
         note = QLabel('驱动和感知程序启动时加载 Fast DDS 配置。每个程序的话题 QoS 由它自己的代码或启动参数决定。' if deployment else
                       '保存后用于软件的下一轮监听。部署到驱动或感知程序时，可在管理员模块“通信环境”中操作。')
         note.setWordWrap(True)
         layout.addWidget(note)
-        preset = QPushButton('套用同机大点云建议')
+        preset = QPushButton(f'套用同机大点云建议（{format_capacity(DEFAULT_SHM_MIB * MIB, "MB")}）')
         preset.clicked.connect(self.use_lidar_preset)
         layout.addWidget(preset)
-        self.export_button = QPushButton('导出 Fast DDS XML 并复制 Seyond 启动命令…')
+        self.export_button = QPushButton('导出 Fast DDS XML 并复制终端加载命令…')
+        self.export_button.setToolTip('将表单中的传输参数导出为 XML，可在启动任意 Fast DDS 程序前加载。')
         self.export_button.clicked.connect(self.export_profile)
         self.export_button.setVisible(deployment)
         layout.addWidget(self.export_button)
@@ -83,8 +95,8 @@ class CommunicationForm(QWidget):
             self.reliability.setCurrentIndex(self.reliability.findData('best_effort'))
             self.depth.setValue(2)
         self.transport.setCurrentIndex(self.transport.findData('shm'))
-        self.shm.setValue(8)
-        self.udp.setValue(0)
+        self.shm.set_binary_value(DEFAULT_SHM_MIB)
+        self.udp.set_binary_value(0)
 
     def update_options(self):
         transport = self.transport.currentData()
@@ -92,24 +104,28 @@ class CommunicationForm(QWidget):
         self.shm.setEnabled(transport == 'shm')
         self.udp.setEnabled(custom)
         self.export_button.setEnabled(custom)
-        limited = custom and self.udp_limit is not None and self.udp.value() > self.udp_limit
+        limited = custom and self.udp_limit is not None and self.udp.binary_value() * KIB > self.udp_limit
         self.copy_linux.setVisible(self.deployment and limited)
         warning = '。请求值超过 Linux 上限，实际缓冲会受限。' if limited else ''
         self.limits.setText(self.host_text + warning)
 
     def copy_linux_command(self):
-        QApplication.clipboard().setText(f'sudo sysctl -w net.core.rmem_max={self.udp.value() * 1024}')
+        QApplication.clipboard().setText(f'sudo sysctl -w net.core.rmem_max={self.udp.binary_value() * KIB}')
         self.export_status.setText('已复制临时调整命令，可在本机终端运行。下一轮监听时会重新请求缓冲。')
 
     def settings(self):
-        transport = dict(transport=self.transport.currentData(), shm_mib=self.shm.value(), udp_kib=self.udp.value())
+        transport = dict(transport=self.transport.currentData(),
+                         shm_mib=self.shm.binary_value(), udp_kib=self.udp.binary_value())
         if self.deployment:
             return CommunicationSettings(**transport)
         return CommunicationSettings(reliability=self.reliability.currentData(), depth=self.depth.value(),
                                      duration_s=self.duration.value(), note=self.run_note.text().strip(), **transport)
 
     def export_profile(self):
-        path, _ = QFileDialog.getSaveFileName(self, '导出 Fast DDS 配置', 'seyond-fastdds.xml', 'XML 文件 (*.xml)')
+        return self.export_profile_for(profile_shell_command)
+
+    def export_profile_for(self, command_for_path):
+        path, _ = QFileDialog.getSaveFileName(self, '导出 Fast DDS 配置', 'fastdds-pointcloud.xml', 'XML 文件 (*.xml)')
         if not path:
             return
         target = Path(path).absolute()
@@ -118,12 +134,14 @@ class CommunicationForm(QWidget):
             if target.exists() and QMessageBox.question(self, '覆盖已有文件', f'覆盖 {target.name}？') != QMessageBox.Yes:
                 return
         try:
+            command = command_for_path(target)
             target.write_text(self.settings().fastdds_xml(), encoding='utf-8')
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, '导出失败', str(exc))
             return
-        QApplication.clipboard().setText(f'{PROFILE_VARIABLE}={shlex.quote(str(target))} ros2 launch seyond start.py')
-        self.export_status.setText('已保存 XML 并复制启动命令。在终端重启 Seyond 驱动时可粘贴使用。')
+        QApplication.clipboard().setText(command)
+        self.export_status.setText('已保存 XML 并复制加载命令。先在终端执行加载命令，再启动所需的驱动或感知程序。')
+        return target
 
 
 class CommunicationDialog(QDialog):

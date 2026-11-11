@@ -137,7 +137,7 @@ def test_real_recording_frequency_and_sequence_integrity(tmp_path, storage):
 
 
 @pytest.mark.integration
-def test_compile_load_and_record_custom_message(tmp_path, monkeypatch):
+def test_compile_load_and_record_custom_message_without_source(tmp_path, monkeypatch):
     monkeypatch.setenv('XDG_CACHE_HOME', str(tmp_path / 'cache'))
     workspace = tmp_path / 'custom ws with spaces'
     package = workspace / 'src' / 'recorder_test_msgs'
@@ -169,9 +169,15 @@ ament_package()
         assert build.wait(100), 'custom message build timed out'
         assert build.returncode == 0, '\n'.join(logs[-40:])
         assert info.setup.exists()
-        env = load_environment(str(info.setup), isolated_env(173))
+        deployment = tmp_path / 'vehicle'
+        deployment.mkdir()
+        (workspace / 'src').rename(tmp_path / 'source removed')
+        (info.build_root / 'build').rename(tmp_path / 'build removed')
+        install = info.setup.parent.rename(deployment / 'install')
+        setup = install / 'setup.bash'
+        env = load_environment(str(setup), isolated_env(173))
         assert validate_message_types(env, ['recorder_test_msgs']) == ['recorder_test_msgs/msg/Sample']
-        roundtrip(tmp_path, env, 'sqlite3', 'recorder_test_msgs/msg/Sample', str(info.setup), str(workspace))
+        roundtrip(tmp_path, env, 'sqlite3', 'recorder_test_msgs/msg/Sample', str(setup), str(workspace))
     finally:
         if build.returncode is None:
             build.stop(force=True)

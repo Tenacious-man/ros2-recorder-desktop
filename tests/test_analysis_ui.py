@@ -98,11 +98,12 @@ def test_focused_metrics_header_time_comparison_zoom_export_and_cancel(tmp_path,
         assert page.chart.view == page.chart.bounds()
         page.topic_items['/sensor2'].setCheckState(0, Qt.Checked)
         assert len(page.chart.topics) == 2
-        # A real checkbox click can deselect a topic; text selection does not recheck it.
+        # The full row toggles the checkbox without leaving a row highlight.
         item = page.topic_items['/sensor2']
         rect = page.topics.visualItemRect(item)
-        QTest.mouseClick(page.topics.viewport(), Qt.LeftButton, pos=QPoint(rect.left() + 9, rect.center().y()))
+        QTest.mouseClick(page.topics.viewport(), Qt.LeftButton, pos=QPoint(rect.right() - 9, rect.center().y()))
         assert item.checkState(0) == Qt.Unchecked
+        assert not page.topics.selectedItems()
         page.search.setText('sensor2')
         assert page.topic_items['/sensor'].isHidden()
         assert page.topic_items['/sensor'].checkState(0) == Qt.Checked
